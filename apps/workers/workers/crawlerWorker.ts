@@ -1707,7 +1707,7 @@ async function getContentType(
   jobId: string,
   abortSignal: AbortSignal,
   runProxy: RunProxyConfig,
-): Promise<string | null> {
+): Promise<{ contentType: string | null; finalUrl: string }> {
   return await withSpan(
     tracer,
     "crawlerWorker.getContentType",
@@ -1742,12 +1742,13 @@ async function getContentType(
         logger.info(
           `[Crawler][${jobId}] Content-type for the url ${truncateUrl(url)} is "${contentType}"`,
         );
-        return contentType;
+        // response.url reflects the URL after any redirects were followed.
+        return { contentType, finalUrl: response.url };
       } catch (e) {
         logger.error(
           `[Crawler][${jobId}] Failed to determine the content-type for the url ${truncateUrl(url)}: ${e}`,
         );
-        return null;
+        return { contentType: null, finalUrl: url };
       }
     },
   );
@@ -2351,17 +2352,22 @@ async function runCrawler(
       `[Crawler][${jobId}] Skipped fetching content-type for the url ${url} as precrawledArchiveAssetId exists`,
     );
   }
-  const contentType = precrawledArchiveAssetId
-    ? ASSET_TYPES.TEXT_HTML
+  const { contentType, finalUrl } = precrawledArchiveAssetId
+    ? { contentType: ASSET_TYPES.TEXT_HTML, finalUrl: url }
     : await getContentType(url, jobId, job.abortSignal, runProxy);
   job.abortSignal.throwIfAborted();
+
+  // For asset bookmarks the shortener is resolved via the content-type probe's
+  // redirect target (there's no browser crawl to derive it from). The HTML path
+  // below resolves separately inside crawlAndParseUrl via the browser URL.
+  const assetUrl = resolveShortenedBookmarkUrl(url, finalUrl) ?? url;
 
   // Link bookmarks get transformed into asset bookmarks if they point to a supported asset instead of a webpage
   const isPdf = contentType === ASSET_TYPES.APPLICATION_PDF;
 
   if (isPdf) {
     await handleAsAssetBookmark(
-      url,
+      assetUrl,
       "pdf",
       userId,
       jobId,
@@ -2375,7 +2381,7 @@ async function runCrawler(
     SUPPORTED_UPLOAD_ASSET_TYPES.has(contentType)
   ) {
     await handleAsAssetBookmark(
-      url,
+      assetUrl,
       "image",
       userId,
       jobId,
