@@ -75,7 +75,10 @@ import {
 } from "@karakeep/shared/assetdb";
 import serverConfig from "@karakeep/shared/config";
 import logger from "@karakeep/shared/logger";
-import { setUrlHostnameFromResolvedAddress } from "@karakeep/shared/utils/url";
+import {
+  resolveShortenedBookmarkUrl,
+  setUrlHostnameFromResolvedAddress,
+} from "@karakeep/shared/utils/url";
 import {
   DequeuedJob,
   DequeuedJobError,
@@ -2036,12 +2039,24 @@ async function crawlAndParseUrl(
         }
       };
 
+      // Replace a known shortener (search.app/share.google) with its resolved
+      // destination so the bookmark reflects the real URL. See issue #2235.
+      const resolvedUrl = resolveShortenedBookmarkUrl(url, browserUrl);
+      if (resolvedUrl) {
+        logger.info(
+          `[Crawler][${jobId}] Resolved shortened URL "${truncateUrl(
+            url,
+          )}" to "${truncateUrl(resolvedUrl)}". Updating the bookmark URL.`,
+        );
+      }
+
       // Phase 1: Write metadata immediately for fast user feedback.
       // Content and asset storage happen later and can be slow (banner
       // image download, screenshot/pdf upload, etc.).
       await db
         .update(bookmarkLinks)
         .set({
+          ...(resolvedUrl ? { url: resolvedUrl } : {}),
           title: meta.title,
           description: meta.description,
           // Don't store data URIs as they're not valid URLs and are usually quite large
