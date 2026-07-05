@@ -2196,7 +2196,7 @@ async function crawlAndParseUrl(
       // Delete the old assets if any
       await Promise.all(assetDeletionTasks);
 
-      return async () => {
+      const runArchival = async () => {
         if (
           !precrawledArchiveAssetId &&
           (serverConfig.crawler.fullPageArchive || archiveFullPage)
@@ -2238,6 +2238,10 @@ async function crawlAndParseUrl(
           }
         }
       };
+
+      // effectiveUrl reflects any shortener resolution so downstream jobs
+      // (e.g. video) use the real destination, not the opaque short link.
+      return { runArchival, effectiveUrl: resolvedUrl ?? url };
     },
   );
 }
@@ -2380,7 +2384,7 @@ async function runCrawler(
       runProxy,
     );
   } else {
-    const archivalLogic = await crawlAndParseUrl(
+    const { runArchival, effectiveUrl } = await crawlAndParseUrl(
       url,
       userId,
       jobId,
@@ -2441,7 +2445,7 @@ async function runCrawler(
       await VideoWorkerQueue.enqueue(
         {
           bookmarkId,
-          url,
+          url: effectiveUrl,
         },
         enqueueOpts,
       );
@@ -2459,7 +2463,7 @@ async function runCrawler(
     }
 
     // Do the archival as a separate last step as it has the potential for failure
-    await archivalLogic();
+    await runArchival();
   }
 
   // Record the latency from bookmark creation to crawl completion.
