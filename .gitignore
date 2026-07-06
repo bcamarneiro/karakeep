@@ -73,3 +73,7 @@ auth_failures.log
 .codex
 .claude/worktrees
 jean.json
+
+# homelab self-host secrets (do not commit)
+docker/.env
+docker/instagram-cookies.txt
