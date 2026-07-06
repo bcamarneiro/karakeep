@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Full-fidelity backup of a karakeep homelab instance.
-# Archives the `data` volume (SQLite db.db + assets) into a tarball.
+# Archives the `data` volume (SQLite db.db + assets) into a tarball, then
+# verifies the archive is non-empty and contains db.db before declaring success.
 # Meilisearch is derived data — not backed up here; reindex after restore.
 #
 # Usage:
@@ -40,4 +41,15 @@ docker run --rm -v "$DATA_VOL":/data:ro -v "$OUTDIR":/backup alpine \
 echo "Restarting stack…"
 docker compose -f "$COMPOSE" up -d
 
-echo "Done: $OUTDIR/$OUTNAME ($(du -h "$OUTDIR/$OUTNAME" | cut -f1))"
+# Verify the archive before trusting it — a silently-empty backup is the worst case.
+echo "Verifying archive…"
+LIST=$(tar tzf "$OUTDIR/$OUTNAME")
+if ! grep -qE '(^|/)db\.db$' <<<"$LIST"; then
+  echo "ERROR: db.db not found in the archive — this backup is NOT usable."
+  echo "Kept for inspection: $OUTDIR/$OUTNAME"
+  exit 1
+fi
+ASSETS=$(grep -cE '/assets/.+' <<<"$LIST" || true)
+echo "OK: db.db present, ~${ASSETS} asset entries. Size $(du -h "$OUTDIR/$OUTNAME" | cut -f1)."
+echo "Backup: $OUTDIR/$OUTNAME"
+echo "Tip: prove it end-to-end with:  ./docker/restore.sh --verify '$OUTDIR/$OUTNAME'"

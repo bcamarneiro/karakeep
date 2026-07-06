@@ -64,13 +64,18 @@ volume. Meilisearch is a derived search index — not backed up; rebuild it afte
 a restore via **Admin Settings → Background Jobs → Reindex All Bookmarks**.
 
 ```bash
-./docker/backup.sh                      # → karakeep-backup-<timestamp>.tar.gz
-./docker/backup.sh /mnt/nas/kk.tar.gz   # or a path of your choice
-./docker/restore.sh <backup.tar.gz>     # destructive; asks for confirmation
+./docker/backup.sh                        # → karakeep-backup-<timestamp>.tar.gz
+./docker/backup.sh /mnt/nas/kk.tar.gz     # or a path of your choice
+./docker/restore.sh --verify <backup.tgz> # SAFE: prove a backup in a throwaway volume, touches nothing real
+./docker/restore.sh <backup.tar.gz>       # DESTRUCTIVE: replaces the real volume; asks for confirmation
 ```
 
 Both auto-detect the volume name; override with `DATA_VOL=<name>` if needed.
-`backup.sh` stops the stack first so SQLite is copied at rest.
+`backup.sh` stops the stack first so SQLite is copied at rest, then checks the
+archive contains `db.db` before declaring success. `restore.sh --verify`
+extracts into a throwaway volume and runs a SQLite integrity check — use it to
+trust a backup before you rely on it (a backup you haven't restored isn't a
+backup).
 
 ## Migrating homelab ↔ local (no data loss)
 
