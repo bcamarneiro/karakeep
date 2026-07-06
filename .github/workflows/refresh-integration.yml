@@ -1,0 +1,84 @@
+name: Refresh integration branch
+
+# Keeps the personal `local-integration` branch = upstream/main + the two feature
+# branches (shortener, instagram) + homelab-config, refreshed against upstream.
+# Runs on GitHub's infra, so it does not depend on any laptop being on.
+# On a clean merge it force-pushes local-integration; on a conflict it opens a
+# single tracking issue and leaves local-integration untouched.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC (GitHub cron is always UTC)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: refresh-integration
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream main + feature branches
+        run: |
+          git remote add upstream https://github.com/karakeep-app/karakeep.git
+          git fetch upstream main --quiet
+          git fetch origin resolve-shortened-urls instagram-text-extraction homelab-config local-integration --quiet
+
+      - name: Merge recipe
+        id: merge
+        run: |
+          set -e
+          git checkout -B local-integration upstream/main
+          for b in resolve-shortened-urls instagram-text-extraction homelab-config; do
+            if ! git merge --no-ff -m "merge: $b into local-integration" "origin/$b"; then
+              git merge --abort || true
+              echo "conflict_branch=$b" >> "$GITHUB_OUTPUT"
+              echo "status=conflict" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "status=merged" >> "$GITHUB_OUTPUT"
+
+      - name: Push refreshed branch (only if content changed)
+        if: steps.merge.outputs.status == 'merged'
+        run: |
+          before=$(git rev-parse --verify --quiet "origin/local-integration^{tree}" || echo none)
+          after=$(git rev-parse "local-integration^{tree}")
+          if [ "$before" = "$after" ]; then
+            echo "Up to date — integrated content unchanged; nothing to push."
+          else
+            git push -f origin local-integration
+            echo "Pushed refreshed local-integration ($(git rev-parse --short local-integration))."
+          fi
+
+      - name: Open tracking issue on conflict
+        if: steps.merge.outputs.status == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONFLICT_BRANCH: ${{ steps.merge.outputs.conflict_branch }}
+        run: |
+          open=$(gh issue list --state open --label integration-refresh --json number --jq 'length')
+          if [ "$open" != "0" ]; then
+            echo "A conflict issue is already open — not duplicating."
+            exit 0
+          fi
+          gh label create integration-refresh --color BFD4F2 --description "Automated integration refresh" 2>/dev/null || true
+          gh issue create \
+            --label integration-refresh \
+            --title "Integration refresh: conflict merging '${CONFLICT_BRANCH}'" \
+            --body "The weekly refresh of \`local-integration\` (upstream/main + shortener + instagram + homelab-config) hit a merge conflict while merging \`${CONFLICT_BRANCH}\` — most likely in \`apps/workers/workers/crawlerWorker.ts\` where both features touch \`runCrawler\`. \`local-integration\` on the fork was left unchanged, so your homelab keeps running the last good build. Resolve manually (or ask Claude to), then re-run this workflow from the Actions tab. cc @bcamarneiro"
