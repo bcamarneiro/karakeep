@@ -72,7 +72,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CONFLICT_BRANCH: ${{ steps.merge.outputs.conflict_branch }}
         run: |
-          open=$(gh issue list --state open --label integration-refresh --json number --jq 'length')
+          # If a conflict issue is already open, it's tracked — stay green, no spam.
+          open=$(gh issue list --state open --label integration-refresh --json number --jq 'length' 2>/dev/null || echo 0)
           if [ "$open" != "0" ]; then
             echo "A conflict issue is already open — not duplicating."
             exit 0
@@ -81,4 +82,8 @@ jobs:
           gh issue create \
             --label integration-refresh \
             --title "Integration refresh: conflict merging '${CONFLICT_BRANCH}'" \
-            --body "The weekly refresh of \`local-integration\` (upstream/main + shortener + instagram + homelab-config) hit a merge conflict while merging \`${CONFLICT_BRANCH}\` — most likely in \`apps/workers/workers/crawlerWorker.ts\` where both features touch \`runCrawler\`. \`local-integration\` on the fork was left unchanged, so your homelab keeps running the last good build. Resolve manually (or ask Claude to), then re-run this workflow from the Actions tab. cc @bcamarneiro"
+            --body "The weekly refresh of \`local-integration\` (upstream/main + shortener + instagram + homelab-config) hit a merge conflict while merging \`${CONFLICT_BRANCH}\` — most likely in \`apps/workers/workers/crawlerWorker.ts\` where both features touch \`runCrawler\`. \`local-integration\` on the fork was left unchanged, so your homelab keeps running the last good build. Resolve manually (or ask Claude to), then re-run this workflow from the Actions tab. cc @bcamarneiro" || true
+          # Fail the run so you get a notification even if issue creation was blocked.
+          # Next week's run finds the open issue above and stays green, so no weekly spam.
+          echo "::error::Integration refresh hit a conflict merging ${CONFLICT_BRANCH}."
+          exit 1
