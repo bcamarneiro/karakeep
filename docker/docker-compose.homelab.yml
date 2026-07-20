@@ -1,0 +1,57 @@
+# Homelab deployment of a self-built karakeep (branch: local-integration).
+# Builds the all-in-one image from THIS checkout instead of pulling the
+# published image, so your shortener + Instagram changes are included.
+#
+# Usage (run from the repo root, on the branch you want to deploy):
+#   cp docker/.env.homelab.example docker/.env   # then edit the secrets
+#   docker compose -f docker/docker-compose.homelab.yml up -d --build
+#
+# Rebuild after updating the branch:
+#   git pull && docker compose -f docker/docker-compose.homelab.yml up -d --build
+services:
+  web:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: aio
+    restart: unless-stopped
+    volumes:
+      - data:/data
+      # Instagram cookies (Netscape cookies.txt format). Export them with a
+      # browser extension while logged in, drop the file next to this compose
+      # file as docker/instagram-cookies.txt. Referenced by CRAWLER_YTDLP_ARGS.
+      # --cookies-from-browser does NOT work in this headless container.
+      - ./instagram-cookies.txt:/cookies/instagram.txt:ro
+    ports:
+      - 3000:3000
+    env_file:
+      - .env
+    environment:
+      MEILI_ADDR: http://meilisearch:7700
+      BROWSER_WEB_URL: http://chrome:9222
+      DATA_DIR: /data # DON'T CHANGE THIS
+  chrome:
+    image: gcr.io/zenika-hub/alpine-chrome:124
+    restart: unless-stopped
+    command:
+      - --no-sandbox
+      - --disable-gpu
+      - --disable-dev-shm-usage
+      - --remote-debugging-address=0.0.0.0
+      - --remote-debugging-port=9222
+      - --hide-scrollbars
+      - --disable-blink-features=AutomationControlled
+      - --window-size=1440,900
+  meilisearch:
+    image: getmeili/meilisearch:v1.41.0
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MEILI_NO_ANALYTICS: "true"
+    volumes:
+      - meilisearch:/meili_data
+
+volumes:
+  meilisearch:
+  data:
