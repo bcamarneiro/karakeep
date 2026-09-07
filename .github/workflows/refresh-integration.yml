@@ -54,8 +54,28 @@ jobs:
           done
           echo "status=merged" >> "$GITHUB_OUTPUT"
 
+      - name: Setup (for verification)
+        # Reuses the pinned pnpm/Node setup the other CI workflows use, so the
+        # verify step below actually has a working `pnpm` on PATH. Runs after
+        # the merge step so it installs against the merged tree, not the
+        # fork's own main branch. continue-on-error: a broken setup here (e.g.
+        # a registry hiccup) must surface as a verify failure below, not skip
+        # straight to a green push — see the note on the verify step.
+        if: steps.merge.outputs.status != 'conflict'
+        continue-on-error: true
+        uses: ./tooling/github/setup
+
+      - name: Verify the merged branch still builds and its Instagram tests pass
+        if: steps.merge.outputs.status != 'conflict'
+        id: verify
+        continue-on-error: true
+        run: |
+          pnpm --filter @karakeep/shared typecheck
+          pnpm --filter @karakeep/workers typecheck
+          (cd apps/workers && pnpm vitest run workers/crawler/instagram.test.ts workers/crawler/instagramPage.test.ts)
+
       - name: Push refreshed branch (only if content changed)
-        if: steps.merge.outputs.status == 'merged'
+        if: steps.merge.outputs.status == 'merged' && steps.verify.outcome != 'failure'
         run: |
           before=$(git rev-parse --verify --quiet "origin/local-integration^{tree}" || echo none)
           after=$(git rev-parse "local-integration^{tree}")
@@ -66,20 +86,28 @@ jobs:
             echo "Pushed refreshed local-integration ($(git rev-parse --short local-integration))."
           fi
 
-      - name: Open tracking issue on conflict
-        if: steps.merge.outputs.status == 'conflict'
+      - name: Open tracking issue on conflict or verification failure
+        # Fires on either signal from the merge/verify steps above: a textual
+        # merge conflict, or a clean merge that then fails to typecheck or
+        # pass the Instagram tests (upstream frequently touches
+        # packages/shared/inference.ts, so a clean merge is not proof the
+        # build still works).
+        if: steps.merge.outputs.status == 'conflict' || steps.verify.outcome == 'failure'
         env:
           GH_TOKEN: ${{ github.token }}
-          CONFLICT_BRANCH: ${{ steps.merge.outputs.conflict_branch }}
+          CONFLICT_BRANCH: ${{ steps.merge.outputs.status == 'conflict' && steps.merge.outputs.conflict_branch || 'verification' }}
+          FAILURE_REASON: ${{ steps.merge.outputs.status == 'conflict' && format('a merge conflict while merging `{0}`', steps.merge.outputs.conflict_branch) || 'a **verification failure** after a clean merge (shared/workers typecheck or the Instagram extractor tests failed against the merged tree — no textual merge conflict)' }}
         run: |
           # Dedupe on the TITLE, not the label: a label filter silently matches
           # nothing when the label is missing, which would reopen a new issue
-          # every week. Titles are stable per conflicting branch.
+          # every week. Titles are stable per conflicting branch; the
+          # verification-failure case uses the fixed key 'verification' so
+          # repeated verify failures also dedupe onto one issue.
           title="Integration refresh: conflict merging '${CONFLICT_BRANCH}'"
           if gh issue list --state open --search "$title in:title" --json title \
                --jq 'any(.title == "'"$title"'")' | grep -q true; then
-            echo "A conflict issue for '${CONFLICT_BRANCH}' is already open — not duplicating."
-            echo "::error::Integration refresh hit a conflict merging ${CONFLICT_BRANCH} (tracking issue already open)."
+            echo "A tracking issue for '${CONFLICT_BRANCH}' is already open — not duplicating."
+            echo "::error::Integration refresh hit ${FAILURE_REASON} (tracking issue already open)."
             exit 1
           fi
 
@@ -91,12 +119,12 @@ jobs:
           # looks at. Labelling is cosmetic; the issue is the notification.
           if ! url=$(gh issue create \
             --title "$title" \
-            --body "The weekly refresh of \`local-integration\` (upstream/main + shortener + instagram + homelab-config) hit a merge conflict while merging \`${CONFLICT_BRANCH}\`. \`local-integration\` on the fork was left unchanged, so the homelab keeps running the last good build.
+            --body "The weekly refresh of \`local-integration\` (upstream/main + shortener + instagram + homelab-config) hit ${FAILURE_REASON}. \`local-integration\` on the fork was left unchanged, so the homelab keeps running the last good build.
 
-          The usual cause is one of the feature branches drifting far behind upstream — rebase it onto \`upstream/main\` and force-push, which also unblocks its pull request. Then re-run this workflow from the Actions tab.
+          The usual cause is one of the feature branches drifting far behind upstream — rebase it onto \`upstream/main\` and force-push, which also unblocks its pull request. If this was a verification failure rather than a merge conflict, upstream likely changed something the Instagram extractor (or \`packages/shared/inference.ts\`) depends on — check the failed run's logs for the shared/workers typecheck and Instagram test output. Then re-run this workflow from the Actions tab.
 
           cc @bcamarneiro"); then
-            echo "::error::Conflict merging ${CONFLICT_BRANCH}, AND the tracking issue could not be created. Check the issues:write permission on this workflow."
+            echo "::error::Hit ${FAILURE_REASON}, AND the tracking issue could not be created. Check the issues:write permission on this workflow."
             exit 1
           fi
           echo "Opened $url"
@@ -106,6 +134,6 @@ jobs:
             --description "Automated integration refresh" || echo "note: label already exists or could not be created"
           gh issue edit "$url" --add-label integration-refresh || echo "note: could not label $url"
 
-          # Fail the run so the conflict also surfaces in the Actions tab.
-          echo "::error::Integration refresh hit a conflict merging ${CONFLICT_BRANCH}. Tracking issue: $url"
+          # Fail the run so the conflict/failure also surfaces in the Actions tab.
+          echo "::error::Integration refresh hit ${FAILURE_REASON}. Tracking issue: $url"
           exit 1
