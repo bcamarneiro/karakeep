@@ -168,6 +168,7 @@ describe("fetchYouTubeTranscript", () => {
       transcript: "olá mundo",
       source: "manual",
       lang: "pt",
+      failed: false,
     });
     // The auto pass is not even attempted once manual subs exist.
     expect(vi.mocked(execa)).toHaveBeenCalledTimes(1);
@@ -191,7 +192,12 @@ describe("fetchYouTubeTranscript", () => {
   });
 
   it("falls back to auto subs when there are no manual ones", async () => {
-    ytDlpWrites({ auto: { "yt.en.vtt": vtt("hello world") } });
+    // yt-dlp's real output name for `-o <dir>/yt` is unverified until the
+    // e2e, so the language must be read off any `.vtt` in the pass directory,
+    // not off an assumed `yt.` prefix.
+    ytDlpWrites({
+      auto: { "Some Video Title [abc123].en.vtt": vtt("hello world") },
+    });
     const res = await fetchYouTubeTranscript(
       "https://www.youtube.com/watch?v=x",
       "job1",
@@ -202,6 +208,7 @@ describe("fetchYouTubeTranscript", () => {
       transcript: "hello world",
       source: "auto",
       lang: "en",
+      failed: false,
     });
     expect(vi.mocked(execa)).toHaveBeenCalledTimes(2);
   });
@@ -224,6 +231,7 @@ describe("fetchYouTubeTranscript", () => {
       transcript: "hello world",
       source: "auto",
       lang: "en",
+      failed: false,
     });
   });
 
@@ -244,6 +252,7 @@ describe("fetchYouTubeTranscript", () => {
       transcript: "hello world",
       source: "manual",
       lang: "en",
+      failed: false,
     });
   });
 
@@ -255,10 +264,16 @@ describe("fetchYouTubeTranscript", () => {
       noProxy,
       new AbortController().signal,
     );
-    expect(res).toEqual({ transcript: "", source: "none", lang: null });
+    // No subtitles is a normal outcome, so nothing failed.
+    expect(res).toEqual({
+      transcript: "",
+      source: "none",
+      lang: null,
+      failed: false,
+    });
   });
 
-  it("reports none instead of throwing when yt-dlp fails", async () => {
+  it("reports none, and flags the failure, when yt-dlp itself fails", async () => {
     ytDlpWrites({ fail: true });
     await expect(
       fetchYouTubeTranscript(
@@ -267,7 +282,12 @@ describe("fetchYouTubeTranscript", () => {
         noProxy,
         new AbortController().signal,
       ),
-    ).resolves.toEqual({ transcript: "", source: "none", lang: null });
+    ).resolves.toEqual({
+      transcript: "",
+      source: "none",
+      lang: null,
+      failed: true,
+    });
   });
 
   it("passes the configured yt-dlp arguments and the proxy through", async () => {

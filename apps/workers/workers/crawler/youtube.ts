@@ -31,12 +31,20 @@ export interface YouTubeTranscript {
   source: "manual" | "auto" | "none";
   /** The language tag of the chosen track, e.g. "pt" or "en-US". */
   lang: string | null;
+  /**
+   * Whether something actually went wrong, as opposed to the video simply
+   * having no subtitles. Both come back as `source: "none"`, but only the
+   * former is worth an operator's attention, so the caller logs the first as
+   * `status=partial` and the second as `status=ok`.
+   */
+  failed: boolean;
 }
 
 const NO_TRANSCRIPT: YouTubeTranscript = {
   transcript: "",
   source: "none",
   lang: null,
+  failed: false,
 };
 
 function escapeHtml(s: string): string {
@@ -70,10 +78,13 @@ export function isYouTubeUrl(url: string): boolean {
 }
 
 /**
- * The language tag out of a subtitle file yt-dlp wrote as `<base>.<lang>.vtt`.
+ * The language tag of a subtitle file, from the `.<lang>.vtt` suffix yt-dlp
+ * appends. The part before it is not matched: the output template is ours
+ * (`-o <dir>/yt`), but what yt-dlp actually names the file is only confirmed
+ * against the real binary, and the pass directory holds nothing else.
  */
-function langOf(file: string, base: string): string | null {
-  const m = new RegExp(`^${base}\\.(.+)\\.vtt$`).exec(file);
+function langOf(file: string): string | null {
+  const m = /\.([A-Za-z0-9-]+)\.vtt$/.exec(file);
   return m ? m[1] : null;
 }
 
@@ -92,7 +103,6 @@ function langOf(file: string, base: string): string | null {
 export function orderSubtitleFiles(
   files: string[],
   langs: string,
-  base = "yt",
 ): { file: string; lang: string }[] {
   const specs = langs
     .split(",")
@@ -107,7 +117,7 @@ export function orderSubtitleFiles(
   };
   return (
     files
-      .map((file) => ({ file, lang: langOf(file, base) }))
+      .map((file) => ({ file, lang: langOf(file) }))
       .filter((c): c is { file: string; lang: string } => c.lang !== null)
       // Sort by lang tag first so ties within one selector are deterministic.
       .sort((a, b) => a.lang.localeCompare(b.lang))
@@ -126,13 +136,19 @@ export function orderSubtitleFiles(
  * logged and whatever landed on disk is read anyway — a throw here must not
  * cost us the other pass.
  */
+interface PassResult {
+  track: { transcript: string; lang: string } | null;
+  /** yt-dlp itself misbehaved, as opposed to the video having no such track. */
+  failed: boolean;
+}
+
 async function subtitlePass(
   url: string,
   jobId: string,
   auto: boolean,
   runProxy: RunProxyConfig,
   abortSignal: AbortSignal,
-): Promise<{ transcript: string; lang: string } | null> {
+): Promise<PassResult> {
   const dir = await mkdtemp(join(tmpdir(), "karakeep-yt-"));
   try {
     return await runSubtitlePass(url, dir, jobId, auto, runProxy, abortSignal);
@@ -148,7 +164,7 @@ async function runSubtitlePass(
   auto: boolean,
   runProxy: RunProxyConfig,
   abortSignal: AbortSignal,
-): Promise<{ transcript: string; lang: string } | null> {
+): Promise<PassResult> {
   const proxy = runProxy.httpsProxy ?? runProxy.httpProxy;
   const args = [
     "--skip-download",
@@ -165,12 +181,17 @@ async function runSubtitlePass(
     "--",
     url,
   ];
+  let failed = false;
   try {
     await execa("yt-dlp", args, {
       cancelSignal: abortSignal,
       timeout: 60_000,
     });
   } catch (e) {
+    // A video with no track of the kind asked for also exits non-zero, so
+    // this is not conclusive on its own: it only downgrades the outcome if
+    // no track is found on either pass.
+    failed = true;
     logger.warn(
       `[Crawler][${jobId}] yt-dlp ${
         auto ? "auto" : "manual"
@@ -184,10 +205,10 @@ async function runSubtitlePass(
   )) {
     const transcript = parseVtt(await readFile(join(dir, file), "utf8"));
     if (transcript) {
-      return { transcript, lang };
+      return { track: { transcript, lang }, failed: false };
     }
   }
-  return null;
+  return { track: null, failed };
 }
 
 /**
@@ -202,7 +223,8 @@ async function runSubtitlePass(
  *
  * Never throws: a video without subtitles, an unavailable video and a broken
  * yt-dlp all report `none`, because a missing transcript must not fail the
- * crawl that already succeeded.
+ * crawl that already succeeded. `failed` separates the last two — which are
+ * worth an operator's attention — from the first, which is routine.
  */
 export async function fetchYouTubeTranscript(
   url: string,
@@ -210,24 +232,28 @@ export async function fetchYouTubeTranscript(
   runProxy: RunProxyConfig,
   abortSignal: AbortSignal,
 ): Promise<YouTubeTranscript> {
+  let failed = false;
   try {
     for (const auto of [false, true]) {
-      const found = await subtitlePass(url, jobId, auto, runProxy, abortSignal);
+      const pass = await subtitlePass(url, jobId, auto, runProxy, abortSignal);
+      failed = failed || pass.failed;
+      const found = pass.track;
       if (found) {
         return {
           transcript: found.transcript,
           source: auto ? "auto" : "manual",
           lang: found.lang,
+          failed: false,
         };
       }
       if (abortSignal.aborted) break;
     }
-    return NO_TRANSCRIPT;
+    return { ...NO_TRANSCRIPT, failed };
   } catch (e) {
     logger.warn(
       `[Crawler][${jobId}] YouTube transcript fetch failed for "${url}": ${e}`,
     );
-    return NO_TRANSCRIPT;
+    return { ...NO_TRANSCRIPT, failed: true };
   }
 }
 

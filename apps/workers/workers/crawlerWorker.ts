@@ -542,18 +542,22 @@ async function runCrawler(
           runProxy,
           job.abortSignal,
         );
-        const appended =
-          yt.transcript.length > 0 &&
-          (await appendYouTubeTranscript({
+        // A video that simply has no subtitles is a normal outcome, not a
+        // degraded one: `partial` is reserved for something having actually
+        // gone wrong, so that grepping for it finds real problems.
+        let ok = !yt.failed;
+        if (yt.transcript.length > 0) {
+          ok = await appendYouTubeTranscript({
             bookmarkId,
             userId,
             jobId,
             transcript: yt.transcript,
-          }));
+          });
+        }
         logger.info(
           `[Crawler][${jobId}] [yt] subs=${yt.source} lang=${
             yt.lang ?? "none"
-          } status=${appended ? "ok" : "partial"} url="${truncateUrl(url)}"`,
+          } status=${ok ? "ok" : "partial"} url="${truncateUrl(url)}"`,
         );
       } catch (e) {
         logger.warn(
