@@ -70,6 +70,13 @@ jobs:
         id: verify
         continue-on-error: true
         run: |
+          set -euo pipefail
+          # --frozen-lockfile on purpose: the plain `pnpm install` the Setup
+          # step already ran will silently re-resolve a pnpm-lock.yaml that
+          # drifted from package.json during the merge instead of failing.
+          # Re-running with --frozen-lockfile here turns that drift into a
+          # verify failure instead of a quietly-mutated lockfile.
+          pnpm install --frozen-lockfile
           pnpm --filter @karakeep/shared typecheck
           pnpm --filter @karakeep/workers typecheck
           (cd apps/workers && pnpm vitest run workers/crawler/instagram.test.ts workers/crawler/instagramPage.test.ts)
@@ -97,13 +104,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CONFLICT_BRANCH: ${{ steps.merge.outputs.status == 'conflict' && steps.merge.outputs.conflict_branch || 'verification' }}
           FAILURE_REASON: ${{ steps.merge.outputs.status == 'conflict' && format('a merge conflict while merging `{0}`', steps.merge.outputs.conflict_branch) || 'a **verification failure** after a clean merge (shared/workers typecheck or the Instagram extractor tests failed against the merged tree — no textual merge conflict)' }}
+          ISSUE_TITLE: "${{ steps.merge.outputs.status == 'conflict' && format('Integration refresh: conflict merging ''{0}''', steps.merge.outputs.conflict_branch) || 'Integration refresh: verification failed after merge' }}"
         run: |
           # Dedupe on the TITLE, not the label: a label filter silently matches
           # nothing when the label is missing, which would reopen a new issue
-          # every week. Titles are stable per conflicting branch; the
-          # verification-failure case uses the fixed key 'verification' so
-          # repeated verify failures also dedupe onto one issue.
-          title="Integration refresh: conflict merging '${CONFLICT_BRANCH}'"
+          # every week. Titles are stable per failure kind — one fixed title
+          # for verification failures (so repeated verify failures dedupe
+          # onto one issue), one per conflicting branch for merge conflicts —
+          # and distinct from each other so a verification failure no longer
+          # reads as a merge conflict in the issue list.
+          title="${ISSUE_TITLE}"
           if gh issue list --state open --search "$title in:title" --json title \
                --jq 'any(.title == "'"$title"'")' | grep -q true; then
             echo "A tracking issue for '${CONFLICT_BRANCH}' is already open — not duplicating."
