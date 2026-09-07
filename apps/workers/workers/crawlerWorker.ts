@@ -51,11 +51,7 @@ import {
   handleAsAssetBookmark,
 } from "./crawler/crawlAndParse";
 import { handleInstagramBookmark, isInstagramUrl } from "./crawler/instagram";
-import {
-  appendYouTubeTranscript,
-  fetchYouTubeTranscript,
-  isYouTubeUrl,
-} from "./crawler/youtube";
+import { handleYouTubeBookmark, isYouTubeUrl } from "./crawler/youtube";
 import { InstagramTransientError } from "./crawler/instagramPage";
 import {
   getContentTypeAndMetadata,
@@ -424,6 +420,32 @@ async function runCrawler(
     return { status: "completed" };
   }
 
+  // A YouTube watch page crashes the crawler's memory-capped Chrome, so the
+  // browser crawl of a video link fails and the bookmark is left with nothing.
+  // yt-dlp returns the title, description, chapters and subtitles anonymously,
+  // which is strictly more than the page would have given us. If it yields
+  // nothing we fall through to the normal crawl, so a broken yt-dlp is no
+  // worse than not having this at all.
+  if (serverConfig.crawler.youtubeTranscript && isYouTubeUrl(url)) {
+    const handled = await handleYouTubeBookmark({
+      url,
+      jobId,
+      bookmarkId,
+      userId,
+      runProxy,
+      abortSignal: job.abortSignal,
+    });
+    if (handled) {
+      await enqueuePostCrawlJobs(job, bookmarkId, userId, url);
+      return { status: "completed" };
+    }
+    logger.warn(
+      `[Crawler][${jobId}] yt-dlp yielded nothing for "${truncateUrl(
+        url,
+      )}"; falling back to the browser crawl`,
+    );
+  }
+
   if (precrawledArchiveAssetId) {
     logger.info(
       `[Crawler][${jobId}] Skipped fetching content-type for the url ${url} as precrawledArchiveAssetId exists`,
@@ -527,46 +549,6 @@ async function runCrawler(
       runProxy,
       probeMetadataPromise,
     });
-
-    // A YouTube page crawls to the chrome around the player and none of what
-    // is said in the video. When enabled, append the subtitle track to the
-    // content just stored, before the post-crawl jobs run so that tagging,
-    // summarization, embeddings and search all see it. A missing or
-    // unfetchable transcript is logged and otherwise ignored: the crawl
-    // itself succeeded.
-    if (serverConfig.crawler.youtubeTranscript && isYouTubeUrl(url)) {
-      try {
-        const yt = await fetchYouTubeTranscript(
-          url,
-          jobId,
-          runProxy,
-          job.abortSignal,
-        );
-        // A video that simply has no subtitles is a normal outcome, not a
-        // degraded one: `partial` is reserved for something having actually
-        // gone wrong, so that grepping for it finds real problems.
-        let ok = !yt.failed;
-        if (yt.transcript.length > 0) {
-          ok = await appendYouTubeTranscript({
-            bookmarkId,
-            userId,
-            jobId,
-            transcript: yt.transcript,
-          });
-        }
-        logger.info(
-          `[Crawler][${jobId}] [yt] subs=${yt.source} lang=${
-            yt.lang ?? "none"
-          } status=${ok ? "ok" : "partial"} url="${truncateUrl(url)}"`,
-        );
-      } catch (e) {
-        logger.warn(
-          `[Crawler][${jobId}] [yt] subs=none lang=none status=partial url="${truncateUrl(
-            url,
-          )}": ${e}`,
-        );
-      }
-    }
 
     await enqueuePostCrawlJobs(job, bookmarkId, userId, effectiveUrl);
 

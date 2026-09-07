@@ -10,11 +10,11 @@ const inserted: Record<string, unknown>[] = [];
 const deletedAssetRows: unknown[] = [];
 
 /**
- * Enough of drizzle's builder to record what the append writes. `update`
+ * Enough of drizzle's builder to record what the store writes. `update`
  * collects the `set()` payload, `insert`/`delete` stand in for the asset row
  * bookkeeping that workerUtils.updateAsset does inside the transaction.
  */
-const txn = {
+const builder = {
   update: () => ({
     set: (v: Record<string, unknown>) => {
       setCalls.push(v);
@@ -40,7 +40,9 @@ vi.mock("@karakeep/db", () => ({
     query: {
       bookmarkLinks: { findFirst: (...a: unknown[]) => findFirst(...a) },
     },
-    transaction: (cb: (t: typeof txn) => Promise<void>) => cb(txn),
+    // Both deferred: the factory runs before `builder` is initialised.
+    update: () => builder.update(),
+    transaction: (cb: (t: typeof builder) => Promise<void>) => cb(builder),
   },
 }));
 
@@ -73,20 +75,23 @@ import type { RunProxyConfig } from "network";
 
 import {
   newAssetId,
-  readAsset,
   saveAsset,
   silentDeleteAsset,
 } from "@karakeep/shared/assetdb";
 import serverConfig from "@karakeep/shared/config";
 
+import type { YouTubeContent } from "./youtube";
 import {
-  appendTranscriptHtml,
-  appendYouTubeTranscript,
-  fetchYouTubeTranscript,
+  composeYouTubeHtml,
+  extractYouTubeContent,
+  formatTimestamp,
+  handleYouTubeBookmark,
   isYouTubeUrl,
+  parseInfoJson,
 } from "./youtube";
 
 const noProxy: RunProxyConfig = {} as RunProxyConfig;
+const signal = () => new AbortController().signal;
 
 function vtt(...lines: string[]): string {
   return ["WEBVTT", "", "00:00:01.000 --> 00:00:03.000", ...lines, ""].join(
@@ -94,11 +99,25 @@ function vtt(...lines: string[]): string {
   );
 }
 
+const INFO = {
+  title: "How it works",
+  description: "First line.\nSecond line.\n\nA new paragraph.",
+  uploader: "Some Channel",
+  upload_date: "20260115",
+  duration: 610,
+  chapters: [
+    { title: "Intro", start_time: 0 },
+    { title: "The meat", start_time: 65 },
+  ],
+};
+
 /**
- * Stand in for yt-dlp. `manual` files land on the pass that asks for
- * `--write-subs` only; `auto` files on the pass that adds `--write-auto-subs`.
+ * Stand in for yt-dlp. The pass carrying `--write-info-json` gets the
+ * info.json and the `manual` subtitle files; the pass carrying
+ * `--write-auto-subs` gets the `auto` ones.
  */
 function ytDlpWrites(opts: {
+  info?: Record<string, unknown> | null;
   manual?: Record<string, string>;
   auto?: Record<string, string>;
   fail?: boolean;
@@ -110,12 +129,18 @@ function ytDlpWrites(opts: {
     if (opts.fail) {
       throw new Error("exit 1");
     }
-    const outBase = args[args.indexOf("-o") + 1];
-    const files = args.includes("--write-auto-subs")
-      ? (opts.auto ?? {})
-      : (opts.manual ?? {});
-    for (const [name, body] of Object.entries(files)) {
-      await writeFile(join(dirname(outBase), name), body);
+    const dir = dirname(args[args.indexOf("-o") + 1]);
+    const auto = args.includes("--write-auto-subs");
+    if (args.includes("--write-info-json")) {
+      const info = opts.info === undefined ? INFO : opts.info;
+      if (info !== null) {
+        await writeFile(join(dir, "yt.info.json"), JSON.stringify(info));
+      }
+    }
+    for (const [name, body] of Object.entries(
+      (auto ? opts.auto : opts.manual) ?? {},
+    )) {
+      await writeFile(join(dir, name), body);
     }
     return {};
   }) as unknown as typeof execa);
@@ -152,26 +177,92 @@ describe("isYouTubeUrl", () => {
   });
 });
 
-describe("fetchYouTubeTranscript", () => {
-  it("prefers a manual pt track over an auto en one", async () => {
-    ytDlpWrites({
-      manual: { "yt.pt.vtt": vtt("olá mundo") },
-      auto: { "yt.en.vtt": vtt("hello world") },
+describe("parseInfoJson", () => {
+  it("reads title, description, channel, date, chapters and duration", () => {
+    expect(parseInfoJson(JSON.stringify(INFO))).toEqual({
+      title: "How it works",
+      description: "First line.\nSecond line.\n\nA new paragraph.",
+      channel: "Some Channel",
+      uploadDate: "20260115",
+      durationSec: 610,
+      chapters: [
+        { title: "Intro", startTime: 0 },
+        { title: "The meat", startTime: 65 },
+      ],
     });
-    const res = await fetchYouTubeTranscript(
+  });
+
+  it("defaults every optional field and falls back to `channel`", () => {
+    expect(parseInfoJson(JSON.stringify({ channel: "Fallback" }))).toEqual({
+      title: "",
+      description: "",
+      channel: "Fallback",
+      uploadDate: null,
+      chapters: [],
+      durationSec: null,
+    });
+  });
+
+  it("drops chapters without a start time, and returns null on bad JSON", () => {
+    const parsed = parseInfoJson(
+      JSON.stringify({ chapters: [{ title: "no start" }, { start_time: 12 }] }),
+    );
+    expect(parsed?.chapters).toEqual([{ title: "", startTime: 12 }]);
+    expect(parseInfoJson("not json")).toBeNull();
+  });
+});
+
+describe("extractYouTubeContent", () => {
+  it("returns metadata and the manual track from a single yt-dlp pass", async () => {
+    ytDlpWrites({ manual: { "yt.pt.vtt": vtt("olá mundo") } });
+    const res = await extractYouTubeContent(
       "https://www.youtube.com/watch?v=x",
       "job1",
       noProxy,
-      new AbortController().signal,
+      signal(),
     );
-    expect(res).toEqual({
+    expect(res).toMatchObject({
+      title: "How it works",
+      channel: "Some Channel",
+      uploadDate: "20260115",
       transcript: "olá mundo",
-      source: "manual",
+      subs: "manual",
       lang: "pt",
       failed: false,
     });
-    // The auto pass is not even attempted once manual subs exist.
+    expect(res?.chapters).toHaveLength(2);
+    // Metadata and manual subs come from one invocation.
     expect(vi.mocked(execa)).toHaveBeenCalledTimes(1);
+    const args = vi.mocked(execa).mock.calls[0][1] as string[];
+    expect(args).toContain("--write-info-json");
+    expect(args).toContain("--skip-download");
+    expect(args).toContain("--write-subs");
+    expect(args).not.toContain("--write-auto-subs");
+  });
+
+  it("runs a second pass for auto captions only when there are no manual ones", async () => {
+    // yt-dlp's real output name for `-o <dir>/yt` is unverified until the
+    // e2e, so the language must be read off any `.vtt`, not an assumed prefix.
+    ytDlpWrites({
+      auto: { "Some Video Title [abc123].en.vtt": vtt("hello world") },
+    });
+    const res = await extractYouTubeContent(
+      "https://www.youtube.com/watch?v=x",
+      "job1",
+      noProxy,
+      signal(),
+    );
+    expect(res).toMatchObject({
+      title: "How it works",
+      transcript: "hello world",
+      subs: "auto",
+      lang: "en",
+      failed: false,
+    });
+    expect(vi.mocked(execa)).toHaveBeenCalledTimes(2);
+    const second = vi.mocked(execa).mock.calls[1][1] as string[];
+    expect(second).toContain("--write-auto-subs");
+    expect(second).not.toContain("--write-info-json");
   });
 
   it("honours the configured language order among manual tracks", async () => {
@@ -181,36 +272,14 @@ describe("fetchYouTubeTranscript", () => {
         "yt.pt-BR.vtt": vtt("olá mundo"),
       },
     });
-    const res = await fetchYouTubeTranscript(
+    const res = await extractYouTubeContent(
       "https://www.youtube.com/watch?v=x",
       "job1",
       noProxy,
-      new AbortController().signal,
+      signal(),
     );
-    expect(res.lang).toBe("pt-BR");
-    expect(res.transcript).toBe("olá mundo");
-  });
-
-  it("falls back to auto subs when there are no manual ones", async () => {
-    // yt-dlp's real output name for `-o <dir>/yt` is unverified until the
-    // e2e, so the language must be read off any `.vtt` in the pass directory,
-    // not off an assumed `yt.` prefix.
-    ytDlpWrites({
-      auto: { "Some Video Title [abc123].en.vtt": vtt("hello world") },
-    });
-    const res = await fetchYouTubeTranscript(
-      "https://www.youtube.com/watch?v=x",
-      "job1",
-      noProxy,
-      new AbortController().signal,
-    );
-    expect(res).toEqual({
-      transcript: "hello world",
-      source: "auto",
-      lang: "en",
-      failed: false,
-    });
-    expect(vi.mocked(execa)).toHaveBeenCalledTimes(2);
+    expect(res?.lang).toBe("pt-BR");
+    expect(res?.transcript).toBe("olá mundo");
   });
 
   it("does not let an empty preferred track shadow a usable auto one", async () => {
@@ -221,73 +290,59 @@ describe("fetchYouTubeTranscript", () => {
       manual: { "yt.pt.vtt": "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\n\n" },
       auto: { "yt.en.vtt": vtt("hello world") },
     });
-    const res = await fetchYouTubeTranscript(
+    const res = await extractYouTubeContent(
       "https://www.youtube.com/watch?v=x",
       "job1",
       noProxy,
-      new AbortController().signal,
+      signal(),
     );
-    expect(res).toEqual({
+    expect(res).toMatchObject({
       transcript: "hello world",
-      source: "auto",
+      subs: "auto",
       lang: "en",
-      failed: false,
     });
   });
 
-  it("falls back to a lesser-preferred track that actually has text", async () => {
-    ytDlpWrites({
-      manual: {
-        "yt.pt.vtt": "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\n\n",
-        "yt.en.vtt": vtt("hello world"),
-      },
-    });
-    const res = await fetchYouTubeTranscript(
-      "https://www.youtube.com/watch?v=x",
-      "job1",
-      noProxy,
-      new AbortController().signal,
-    );
-    expect(res).toEqual({
-      transcript: "hello world",
-      source: "manual",
-      lang: "en",
-      failed: false,
-    });
-  });
-
-  it("reports none when yt-dlp writes nothing", async () => {
+  it("keeps the metadata when the video simply has no subtitles", async () => {
     ytDlpWrites({});
-    const res = await fetchYouTubeTranscript(
+    const res = await extractYouTubeContent(
       "https://www.youtube.com/watch?v=x",
       "job1",
       noProxy,
-      new AbortController().signal,
+      signal(),
     );
     // No subtitles is a normal outcome, so nothing failed.
-    expect(res).toEqual({
+    expect(res).toMatchObject({
+      title: "How it works",
       transcript: "",
-      source: "none",
+      subs: "none",
       lang: null,
       failed: false,
     });
   });
 
-  it("reports none, and flags the failure, when yt-dlp itself fails", async () => {
-    ytDlpWrites({ fail: true });
+  it("returns null when yt-dlp writes no info.json at all", async () => {
+    ytDlpWrites({ info: null });
     await expect(
-      fetchYouTubeTranscript(
+      extractYouTubeContent(
         "https://www.youtube.com/watch?v=x",
         "job1",
         noProxy,
-        new AbortController().signal,
+        signal(),
       ),
-    ).resolves.toEqual({
-      transcript: "",
-      source: "none",
-      lang: null,
-      failed: true,
-    });
+    ).resolves.toBeNull();
+  });
+
+  it("returns null when yt-dlp fails outright", async () => {
+    ytDlpWrites({ fail: true });
+    await expect(
+      extractYouTubeContent(
+        "https://www.youtube.com/watch?v=x",
+        "job1",
+        noProxy,
+        signal(),
+      ),
+    ).resolves.toBeNull();
   });
 
   it("passes the configured yt-dlp arguments and the proxy through", async () => {
@@ -295,19 +350,16 @@ describe("fetchYouTubeTranscript", () => {
     const before = serverConfig.crawler.ytDlpArguments;
     serverConfig.crawler.ytDlpArguments = ["--sleep-requests", "1"];
     try {
-      await fetchYouTubeTranscript(
+      await extractYouTubeContent(
         "https://www.youtube.com/watch?v=x",
         "job1",
         { httpsProxy: "http://proxy:8080" } as RunProxyConfig,
-        new AbortController().signal,
+        signal(),
       );
     } finally {
       serverConfig.crawler.ytDlpArguments = before;
     }
     const args = vi.mocked(execa).mock.calls[0][1] as string[];
-    expect(args).toContain("--skip-download");
-    expect(args).toContain("--write-subs");
-    expect(args).not.toContain("--write-auto-subs");
     expect(args).toEqual(
       expect.arrayContaining(["--sleep-requests", "1", "--proxy"]),
     );
@@ -315,78 +367,128 @@ describe("fetchYouTubeTranscript", () => {
   });
 });
 
-describe("appendTranscriptHtml", () => {
-  it("escapes HTML and appends after the existing content", () => {
-    expect(appendTranscriptHtml("<p>page</p>", "a < b & c > d")).toBe(
-      "<p>page</p>\n<h2>Transcript</h2>\n<p>a &lt; b &amp; c &gt; d</p>",
+describe("formatTimestamp", () => {
+  it("is mm:ss, and h:mm:ss past the first hour", () => {
+    expect(formatTimestamp(0)).toBe("0:00");
+    expect(formatTimestamp(65)).toBe("1:05");
+    expect(formatTimestamp(610)).toBe("10:10");
+    expect(formatTimestamp(3661)).toBe("1:01:01");
+  });
+});
+
+const CONTENT: YouTubeContent = {
+  title: "Tom & Jerry <live>",
+  description: "First line.\nSecond line.\n\nA <new> paragraph.",
+  channel: "Some Channel",
+  uploadDate: "20260115",
+  durationSec: 610,
+  chapters: [
+    { title: "Intro", startTime: 0 },
+    { title: "The <meat>", startTime: 65 },
+  ],
+  transcript: "a < b & c",
+  subs: "manual",
+  lang: "pt",
+  failed: false,
+};
+
+describe("composeYouTubeHtml", () => {
+  it("lays out title, description, chapters, transcript, footer and marker", () => {
+    expect(composeYouTubeHtml(CONTENT)).toBe(
+      [
+        "<h1>Tom &amp; Jerry &lt;live&gt;</h1>",
+        "<p>First line.<br>Second line.</p>",
+        "<p>A &lt;new&gt; paragraph.</p>",
+        "<h2>Chapters</h2>",
+        "<ul>",
+        "<li>0:00 – Intro</li>",
+        "<li>1:05 – The &lt;meat&gt;</li>",
+        "</ul>",
+        "<h2>Transcript</h2>",
+        "<p>a &lt; b &amp; c</p>",
+        "<p><small>Some Channel · 2026-01-15</small></p>",
+        "<!-- karakeep-yt subs=manual lang=pt status=ok -->",
+      ].join("\n"),
     );
   });
 
-  it("stands alone when there is no existing content", () => {
-    expect(appendTranscriptHtml(null, "hi")).toBe(
-      "<h2>Transcript</h2>\n<p>hi</p>",
+  it("omits the sections it has nothing for and marks a failed sub fetch", () => {
+    const html = composeYouTubeHtml({
+      ...CONTENT,
+      description: "",
+      chapters: [],
+      transcript: "",
+      subs: "none",
+      lang: null,
+      failed: true,
+    });
+    expect(html).not.toContain("<h2>Chapters</h2>");
+    expect(html).not.toContain("<h2>Transcript</h2>");
+    expect(html).toContain("<h1>Tom &amp; Jerry &lt;live&gt;</h1>");
+    expect(html).toContain(
+      "<!-- karakeep-yt subs=none lang=none status=partial -->",
     );
   });
 });
 
-describe("appendYouTubeTranscript", () => {
-  it("appends to inline content and leaves it inline", async () => {
-    findFirst.mockResolvedValue({
-      htmlContent: "<p>page</p>",
-      contentAssetId: null,
-    });
-    const ok = await appendYouTubeTranscript({
+describe("handleYouTubeBookmark", () => {
+  const call = () =>
+    handleYouTubeBookmark({
+      url: "https://www.youtube.com/watch?v=x",
+      jobId: "job1",
       bookmarkId: "bm1",
       userId: "u1",
-      jobId: "job1",
-      transcript: "spoken <words>",
+      runProxy: noProxy,
+      abortSignal: signal(),
     });
-    expect(ok).toBe(true);
+
+  it("stores the composed content inline and sets title, description and author", async () => {
+    findFirst.mockResolvedValue({ contentAssetId: null });
+    ytDlpWrites({ manual: { "yt.pt.vtt": vtt("olá mundo") } });
+
+    await expect(call()).resolves.toBe(true);
+
     expect(setCalls).toHaveLength(1);
-    expect(setCalls[0]).toMatchObject({
-      htmlContent:
-        "<p>page</p>\n<h2>Transcript</h2>\n<p>spoken &lt;words&gt;</p>",
+    const written = setCalls[0];
+    expect(written).toMatchObject({
+      title: "How it works",
+      description: "First line.\nSecond line.\n\nA new paragraph.",
+      author: "Some Channel",
+      crawlStatusCode: 200,
       contentAssetId: null,
     });
+    expect(written.crawledAt).toBeInstanceOf(Date);
+    expect(written.htmlContent).toContain("<h1>How it works</h1>");
+    expect(written.htmlContent).toContain("<h2>Chapters</h2>");
+    expect(written.htmlContent).toContain("<p>olá mundo</p>");
     expect(vi.mocked(saveAsset)).not.toHaveBeenCalled();
   });
 
-  it("reads, appends to and re-stores content that lives in an asset", async () => {
-    vi.mocked(readAsset).mockResolvedValue({
-      asset: Buffer.from("<p>big page</p>", "utf8"),
-    } as unknown as Awaited<ReturnType<typeof readAsset>>);
-    findFirst.mockResolvedValue({
-      htmlContent: null,
-      contentAssetId: "old-asset-id",
+  it("falls back to the transcript for the description when there is none", async () => {
+    findFirst.mockResolvedValue({ contentAssetId: null });
+    ytDlpWrites({
+      info: { ...INFO, description: "" },
+      manual: { "yt.pt.vtt": vtt("olá mundo") },
     });
-    // Force the asset path regardless of the appended size.
+    await call();
+    expect(setCalls[0]).toMatchObject({ description: "olá mundo" });
+  });
+
+  it("stores large content as an asset, superseding the previous one", async () => {
+    findFirst.mockResolvedValue({ contentAssetId: "old-asset-id" });
+    ytDlpWrites({ manual: { "yt.pt.vtt": vtt("olá mundo") } });
     const before = serverConfig.crawler.htmlContentSizeThreshold;
     serverConfig.crawler.htmlContentSizeThreshold = 1;
     try {
-      const ok = await appendYouTubeTranscript({
-        bookmarkId: "bm1",
-        userId: "u1",
-        jobId: "job1",
-        transcript: "spoken words",
-      });
-      expect(ok).toBe(true);
+      await expect(call()).resolves.toBe(true);
     } finally {
       serverConfig.crawler.htmlContentSizeThreshold = before;
     }
-    expect(vi.mocked(readAsset)).toHaveBeenCalledWith({
-      userId: "u1",
-      assetId: "old-asset-id",
-    });
-    const saved = vi.mocked(saveAsset).mock.calls[0][0];
-    expect((saved.asset as Buffer).toString("utf8")).toBe(
-      "<p>big page</p>\n<h2>Transcript</h2>\n<p>spoken words</p>",
-    );
     expect(setCalls[0]).toMatchObject({
       htmlContent: null,
       contentAssetId: "new-asset-id",
     });
     expect(vi.mocked(newAssetId)).toHaveBeenCalled();
-    // The asset row is repointed and the superseded blob deleted.
     expect(inserted[0]).toMatchObject({ id: "new-asset-id", userId: "u1" });
     expect(vi.mocked(silentDeleteAsset)).toHaveBeenCalledWith(
       "u1",
@@ -394,39 +496,38 @@ describe("appendYouTubeTranscript", () => {
     );
   });
 
-  it("writes nothing when the content could not be stored", async () => {
-    findFirst.mockResolvedValue({
-      htmlContent: "<p>page</p>",
-      contentAssetId: null,
-    });
-    // A quota failure makes storeHtmlContent report not_stored; the crawled
-    // content must survive untouched rather than be nulled out.
+  it("keeps the metadata but not the content when the store is refused", async () => {
+    findFirst.mockResolvedValue({ contentAssetId: null });
+    ytDlpWrites({ manual: { "yt.pt.vtt": vtt("olá mundo") } });
     const before = serverConfig.crawler.htmlContentSizeThreshold;
     serverConfig.crawler.htmlContentSizeThreshold = 1;
     checkStorageQuota.mockRejectedValueOnce(new Error("over quota"));
     try {
-      const ok = await appendYouTubeTranscript({
-        bookmarkId: "bm1",
-        userId: "u1",
-        jobId: "job1",
-        transcript: "spoken words",
-      });
-      expect(ok).toBe(false);
+      // Still handled: the metadata is worth having, and falling through to
+      // the browser crawl would only crash Chrome.
+      await expect(call()).resolves.toBe(true);
     } finally {
       serverConfig.crawler.htmlContentSizeThreshold = before;
     }
+    expect(setCalls).toHaveLength(1);
+    expect(setCalls[0]).toMatchObject({ title: "How it works" });
+    // The content columns are left exactly as they were.
+    expect(setCalls[0]).not.toHaveProperty("htmlContent");
+    expect(setCalls[0]).not.toHaveProperty("contentAssetId");
+  });
+
+  it("reports not handled when yt-dlp yields nothing, so the caller can fall back", async () => {
+    ytDlpWrites({ info: null });
+    await expect(call()).resolves.toBe(false);
     expect(setCalls).toHaveLength(0);
   });
 
-  it("does nothing for a bookmark that is not there", async () => {
+  it("does nothing for a bookmark that is gone", async () => {
     findFirst.mockResolvedValue(undefined);
-    const ok = await appendYouTubeTranscript({
-      bookmarkId: "gone",
-      userId: "u1",
-      jobId: "job1",
-      transcript: "spoken words",
-    });
-    expect(ok).toBe(false);
+    ytDlpWrites({ manual: { "yt.pt.vtt": vtt("olá mundo") } });
+    // Extraction worked, so the URL is still considered handled; there is
+    // simply no row left to write to.
+    await expect(call()).resolves.toBe(true);
     expect(setCalls).toHaveLength(0);
   });
 });
