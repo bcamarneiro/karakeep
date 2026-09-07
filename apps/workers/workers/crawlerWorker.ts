@@ -51,6 +51,11 @@ import {
   handleAsAssetBookmark,
 } from "./crawler/crawlAndParse";
 import { handleInstagramBookmark, isInstagramUrl } from "./crawler/instagram";
+import {
+  appendYouTubeTranscript,
+  fetchYouTubeTranscript,
+  isYouTubeUrl,
+} from "./crawler/youtube";
 import { InstagramTransientError } from "./crawler/instagramPage";
 import {
   getContentTypeAndMetadata,
@@ -522,6 +527,42 @@ async function runCrawler(
       runProxy,
       probeMetadataPromise,
     });
+
+    // A YouTube page crawls to the chrome around the player and none of what
+    // is said in the video. When enabled, append the subtitle track to the
+    // content just stored, before the post-crawl jobs run so that tagging,
+    // summarization, embeddings and search all see it. A missing or
+    // unfetchable transcript is logged and otherwise ignored: the crawl
+    // itself succeeded.
+    if (serverConfig.crawler.youtubeTranscript && isYouTubeUrl(url)) {
+      try {
+        const yt = await fetchYouTubeTranscript(
+          url,
+          jobId,
+          runProxy,
+          job.abortSignal,
+        );
+        const appended =
+          yt.transcript.length > 0 &&
+          (await appendYouTubeTranscript({
+            bookmarkId,
+            userId,
+            jobId,
+            transcript: yt.transcript,
+          }));
+        logger.info(
+          `[Crawler][${jobId}] [yt] subs=${yt.source} lang=${
+            yt.lang ?? "none"
+          } status=${appended ? "ok" : "partial"} url="${truncateUrl(url)}"`,
+        );
+      } catch (e) {
+        logger.warn(
+          `[Crawler][${jobId}] [yt] subs=none lang=none status=partial url="${truncateUrl(
+            url,
+          )}": ${e}`,
+        );
+      }
+    }
 
     await enqueuePostCrawlJobs(job, bookmarkId, userId, effectiveUrl);
 
