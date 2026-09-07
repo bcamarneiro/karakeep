@@ -90,6 +90,7 @@ const allEnv = z.object({
   INFERENCE_FETCH_TIMEOUT_SEC: z.coerce.number().default(300),
   INFERENCE_TEXT_MODEL: z.string().default("gpt-5.6-luna"),
   INFERENCE_IMAGE_MODEL: z.string().default("gpt-4o-mini"),
+  INFERENCE_AUDIO_MODEL: z.string().default("whisper-1"),
   EMBEDDING_ENABLE_AUTO_INDEXING: optionalStringBool(),
   EMBEDDING_OPENAI_API_KEY: z.string().optional(),
   EMBEDDING_OPENAI_BASE_URL: z.string().url().optional(),
@@ -141,6 +142,11 @@ const allEnv = z.object({
   CRAWLER_FULL_PAGE_ARCHIVE: stringBool("false"),
   CRAWLER_VIDEO_DOWNLOAD: stringBool("false"),
   CRAWLER_INSTAGRAM_ENABLED: stringBool("false"),
+  CRAWLER_INSTAGRAM_TRANSCRIBE: stringBool("false"),
+  CRAWLER_INSTAGRAM_TRANSCRIBE_MAX_DURATION_SEC: z.coerce
+    .number()
+    .positive()
+    .default(15 * 60),
   CRAWLER_VIDEO_DOWNLOAD_MAX_SIZE: z.coerce.number().default(50),
   CRAWLER_VIDEO_DOWNLOAD_TIMEOUT_SEC: z.coerce.number().default(10 * 60),
   CRAWLER_ENABLE_ADBLOCKER: stringBool("true"),
@@ -349,6 +355,7 @@ const serverConfigSchema = allEnv.transform((val, ctx) => {
       chatModel: val.CHAT_MODEL ?? val.INFERENCE_TEXT_MODEL,
       textModel: val.INFERENCE_TEXT_MODEL,
       imageModel: val.INFERENCE_IMAGE_MODEL,
+      audioModel: val.INFERENCE_AUDIO_MODEL,
       inferredTagLang: val.INFERENCE_LANG,
       contextLength: val.INFERENCE_CONTEXT_LENGTH,
       maxOutputTokens: val.INFERENCE_MAX_OUTPUT_TOKENS,
@@ -412,6 +419,9 @@ const serverConfigSchema = allEnv.transform((val, ctx) => {
       fullPageArchive: val.CRAWLER_FULL_PAGE_ARCHIVE,
       downloadVideo: val.CRAWLER_VIDEO_DOWNLOAD,
       instagramEnabled: val.CRAWLER_INSTAGRAM_ENABLED,
+      instagramTranscribe: val.CRAWLER_INSTAGRAM_TRANSCRIBE,
+      instagramTranscribeMaxDurationSec:
+        val.CRAWLER_INSTAGRAM_TRANSCRIBE_MAX_DURATION_SEC,
       maxVideoDownloadSize: val.CRAWLER_VIDEO_DOWNLOAD_MAX_SIZE,
       downloadVideoTimeout: val.CRAWLER_VIDEO_DOWNLOAD_TIMEOUT_SEC,
       enableAdblocker: val.CRAWLER_ENABLE_ADBLOCKER,
