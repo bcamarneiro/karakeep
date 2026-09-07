@@ -206,6 +206,47 @@ describe("fetchYouTubeTranscript", () => {
     expect(vi.mocked(execa)).toHaveBeenCalledTimes(2);
   });
 
+  it("does not let an empty preferred track shadow a usable auto one", async () => {
+    // YouTube serves position-only or empty cues for some videos. A pt track
+    // that parses to nothing must not hide the en auto track that has text —
+    // and the leftover pt file must not be picked up by the auto pass either.
+    ytDlpWrites({
+      manual: { "yt.pt.vtt": "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\n\n" },
+      auto: { "yt.en.vtt": vtt("hello world") },
+    });
+    const res = await fetchYouTubeTranscript(
+      "https://www.youtube.com/watch?v=x",
+      "job1",
+      noProxy,
+      new AbortController().signal,
+    );
+    expect(res).toEqual({
+      transcript: "hello world",
+      source: "auto",
+      lang: "en",
+    });
+  });
+
+  it("falls back to a lesser-preferred track that actually has text", async () => {
+    ytDlpWrites({
+      manual: {
+        "yt.pt.vtt": "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\n\n",
+        "yt.en.vtt": vtt("hello world"),
+      },
+    });
+    const res = await fetchYouTubeTranscript(
+      "https://www.youtube.com/watch?v=x",
+      "job1",
+      noProxy,
+      new AbortController().signal,
+    );
+    expect(res).toEqual({
+      transcript: "hello world",
+      source: "manual",
+      lang: "en",
+    });
+  });
+
   it("reports none when yt-dlp writes nothing", async () => {
     ytDlpWrites({});
     const res = await fetchYouTubeTranscript(

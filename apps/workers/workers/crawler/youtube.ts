@@ -78,53 +78,77 @@ function langOf(file: string, base: string): string | null {
 }
 
 /**
- * Pick the subtitle file whose language comes first in the configured
- * preference list. `CRAWLER_YOUTUBE_SUB_LANGS` holds yt-dlp language
- * selectors ("pt.*,en.*"), so a trailing `.*` is a prefix match: "pt.*"
- * matches the `pt`, `pt-BR` and `pt-orig` tracks YouTube serves. Anything
- * else is matched literally. A track yt-dlp returned that matches nothing in
- * the list still beats no transcript at all, so it is used as a last resort.
+ * Order the subtitle files by the configured language preference.
+ * `CRAWLER_YOUTUBE_SUB_LANGS` holds yt-dlp language selectors ("pt.*,en.*"),
+ * so a trailing `.*` is a prefix match: "pt.*" matches the `pt`, `pt-BR` and
+ * `pt-orig` tracks YouTube serves. Anything else is matched literally.
+ *
+ * Every track is returned, not just the best one: a preferred track can turn
+ * out to parse to nothing (YouTube serves position-only or empty cues for
+ * some videos), and it must not shadow a lower-preference track that does
+ * carry text. Tracks matching no selector sort last — they still beat no
+ * transcript at all.
  */
-export function pickSubtitleFile(
+export function orderSubtitleFiles(
   files: string[],
   langs: string,
   base = "yt",
-): { file: string; lang: string } | null {
-  const candidates = files
-    .map((file) => ({ file, lang: langOf(file, base) }))
-    .filter((c): c is { file: string; lang: string } => c.lang !== null)
-    .sort((a, b) => a.lang.localeCompare(b.lang));
-  if (candidates.length === 0) {
-    return null;
-  }
-  for (const spec of langs.split(",").map((l) => l.trim().toLowerCase())) {
-    if (!spec) continue;
-    const match = candidates.find(({ lang }) => {
-      const l = lang.toLowerCase();
-      return spec.endsWith(".*") ? l.startsWith(spec.slice(0, -2)) : l === spec;
-    });
-    if (match) {
-      return match;
-    }
-  }
-  return candidates[0];
+): { file: string; lang: string }[] {
+  const specs = langs
+    .split(",")
+    .map((l) => l.trim().toLowerCase())
+    .filter(Boolean);
+  const rank = ({ lang }: { lang: string }) => {
+    const l = lang.toLowerCase();
+    const i = specs.findIndex((spec) =>
+      spec.endsWith(".*") ? l.startsWith(spec.slice(0, -2)) : l === spec,
+    );
+    return i === -1 ? specs.length : i;
+  };
+  return (
+    files
+      .map((file) => ({ file, lang: langOf(file, base) }))
+      .filter((c): c is { file: string; lang: string } => c.lang !== null)
+      // Sort by lang tag first so ties within one selector are deterministic.
+      .sort((a, b) => a.lang.localeCompare(b.lang))
+      .sort((a, b) => rank(a) - rank(b))
+  );
 }
 
 /**
- * One yt-dlp subtitle pass. Returns the files it left in `dir`.
+ * One yt-dlp subtitle pass, into a directory of its own so that `readdir`
+ * only ever sees this pass's files — a leftover from the manual pass would
+ * otherwise be picked up by, and mislabelled as, the automatic one.
  *
- * yt-dlp exits non-zero when a video carries no track of the kind asked for,
- * so, as on the Instagram path, the exit code is logged and whatever landed
- * on disk is read anyway — a throw here must not cost us the other pass.
+ * Returns the transcript of the first track, in configured language order,
+ * that parses to something. yt-dlp exits non-zero when a video carries no
+ * track of the kind asked for, so, as on the Instagram path, the exit code is
+ * logged and whatever landed on disk is read anyway — a throw here must not
+ * cost us the other pass.
  */
 async function subtitlePass(
+  url: string,
+  jobId: string,
+  auto: boolean,
+  runProxy: RunProxyConfig,
+  abortSignal: AbortSignal,
+): Promise<{ transcript: string; lang: string } | null> {
+  const dir = await mkdtemp(join(tmpdir(), "karakeep-yt-"));
+  try {
+    return await runSubtitlePass(url, dir, jobId, auto, runProxy, abortSignal);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function runSubtitlePass(
   url: string,
   dir: string,
   jobId: string,
   auto: boolean,
   runProxy: RunProxyConfig,
   abortSignal: AbortSignal,
-): Promise<string[]> {
+): Promise<{ transcript: string; lang: string } | null> {
   const proxy = runProxy.httpsProxy ?? runProxy.httpProxy;
   const args = [
     "--skip-download",
@@ -153,7 +177,17 @@ async function subtitlePass(
       } subtitle pass exited non-zero for "${url}": ${e}`,
     );
   }
-  return (await readdir(dir)).filter((f) => f.endsWith(".vtt"));
+  const files = (await readdir(dir)).filter((f) => f.endsWith(".vtt"));
+  for (const { file, lang } of orderSubtitleFiles(
+    files,
+    serverConfig.crawler.youtubeSubLangs,
+  )) {
+    const transcript = parseVtt(await readFile(join(dir, file), "utf8"));
+    if (transcript) {
+      return { transcript, lang };
+    }
+  }
+  return null;
 }
 
 /**
@@ -176,32 +210,15 @@ export async function fetchYouTubeTranscript(
   runProxy: RunProxyConfig,
   abortSignal: AbortSignal,
 ): Promise<YouTubeTranscript> {
-  const dir = await mkdtemp(join(tmpdir(), "karakeep-yt-"));
   try {
     for (const auto of [false, true]) {
-      const files = await subtitlePass(
-        url,
-        dir,
-        jobId,
-        auto,
-        runProxy,
-        abortSignal,
-      );
-      const picked = pickSubtitleFile(
-        files,
-        serverConfig.crawler.youtubeSubLangs,
-      );
-      if (picked) {
-        const transcript = parseVtt(
-          await readFile(join(dir, picked.file), "utf8"),
-        );
-        if (transcript) {
-          return {
-            transcript,
-            source: auto ? "auto" : "manual",
-            lang: picked.lang,
-          };
-        }
+      const found = await subtitlePass(url, jobId, auto, runProxy, abortSignal);
+      if (found) {
+        return {
+          transcript: found.transcript,
+          source: auto ? "auto" : "manual",
+          lang: found.lang,
+        };
       }
       if (abortSignal.aborted) break;
     }
@@ -211,8 +228,6 @@ export async function fetchYouTubeTranscript(
       `[Crawler][${jobId}] YouTube transcript fetch failed for "${url}": ${e}`,
     );
     return NO_TRANSCRIPT;
-  } finally {
-    await rm(dir, { recursive: true, force: true });
   }
 }
 
