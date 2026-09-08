@@ -991,6 +991,8 @@
     "continue_reading": "Continue where you left off",
     "continue_reading_percent": "Continue where you left off ({{percent}}%)",
     "continue_button": "Continue",
+    "gallery_image_count_one": "{{count}} image",
+    "gallery_image_count_other": "{{count}} images",
     "tabs": {
       "content": "Content",
       "details": "Details"

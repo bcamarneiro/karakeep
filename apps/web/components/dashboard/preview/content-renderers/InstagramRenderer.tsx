@@ -2,6 +2,7 @@ import { Instagram } from "lucide-react";
 
 import { BookmarkTypes, ZBookmark } from "@karakeep/shared/types/bookmarks";
 
+import LinkImageGallery from "./LinkImageGallery";
 import { ContentRenderer } from "./types";
 
 type InstagramMediaType = "p" | "reel" | "reels" | "tv";
@@ -55,9 +56,17 @@ function InstagramRendererComponent({ bookmark }: { bookmark: ZBookmark }) {
 
   const mediaType = media.type === "reels" ? "reel" : media.type;
   const embedUrl = `https://www.instagram.com/${mediaType}/${media.shortcode}/embed/captioned`;
+  const linkImageAssets = bookmark.assets.filter(
+    (asset) => asset.assetType === "linkImage",
+  );
 
   return (
     <div className="h-full w-full overflow-auto bg-background p-4">
+      {linkImageAssets.length > 0 && (
+        <div className="mx-auto w-full max-w-[540px]">
+          <LinkImageGallery assets={linkImageAssets} />
+        </div>
+      )}
       <iframe
         src={embedUrl}
         title="Instagram post"

@@ -1083,7 +1083,9 @@
     "crawling_in_progress": "Fetching page content…",
     "continue_reading": "Continue where you left off",
     "continue_reading_percent": "Continue where you left off ({{percent}}%)",
-    "continue_button": "Continue"
+    "continue_button": "Continue",
+    "gallery_image_count_one": "{{count}} image",
+    "gallery_image_count_other": "{{count}} images"
   },
   "toasts": {
     "bookmarks": {

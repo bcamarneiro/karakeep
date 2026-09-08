@@ -40,6 +40,7 @@ import {
 import { READER_FONT_FAMILIES } from "@karakeep/shared/types/readers";
 
 import { contentRendererRegistry } from "./content-renderers";
+import LinkImageGallery from "./content-renderers/LinkImageGallery";
 import ReaderSettingsPopover from "./ReaderSettingsPopover";
 import ReaderView from "./ReaderView";
 import SavedPageOverview from "./SavedPageOverview";
@@ -148,6 +149,18 @@ export default function LinkContentSection({
 
   let content;
 
+  // The reader view ("cached" section) shows the linkImage gallery for
+  // bookmarks that have one (e.g. a link crawled with images attached),
+  // except when a custom renderer that owns its own gallery (currently just
+  // Instagram) is available for this bookmark -- that renderer shows the
+  // gallery in its own tab instead, above its embed.
+  const linkImageAssets = bookmark.assets.filter(
+    (asset) => asset.assetType === "linkImage",
+  );
+  const hasOwnGalleryRenderer = availableRenderers.some(
+    (r) => r.id === "instagram",
+  );
+
   // Check if current section is a custom renderer
   const customRenderer = availableRenderers.find((r) => r.id === section);
   if (customRenderer) {
@@ -160,6 +173,11 @@ export default function LinkContentSection({
   } else if (section === "cached") {
     content = (
       <div className="h-full w-full overflow-y-auto overflow-x-hidden px-3 sm:px-6">
+        {linkImageAssets.length > 0 && !hasOwnGalleryRenderer && (
+          <div className="mx-auto max-w-3xl pt-4">
+            <LinkImageGallery assets={linkImageAssets} />
+          </div>
+        )}
         <ReaderView
           className="mx-auto max-w-3xl"
           style={{
