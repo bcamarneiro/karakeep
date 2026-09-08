@@ -199,11 +199,38 @@ async function ytDlpPass(
   }
 }
 
+/** yt-dlp said the video simply has no track of the kind asked for. */
+const NO_SUBTITLES =
+  /there are no subtitles|has no subtitles|no subtitles for the requested|no automatic captions|no auto.?generated/i;
+
+/** yt-dlp itself misbehaved: throttled, refused, or could not reach YouTube. */
+const REAL_FAILURE =
+  /HTTP Error 429|HTTP Error 5\d\d|rate.?limit|Unable to download|ERROR:/i;
+
 /**
- * yt-dlp exits non-zero when a video carries no track of the kind asked for,
- * so, as on the Instagram path, the exit code is logged and whatever landed
- * on disk is read anyway — a throw here must not cost us the metadata yt-dlp
- * wrote before it, nor the other pass.
+ * Whether a non-zero yt-dlp exit was a real failure or just a video without
+ * the requested captions — the exit code alone cannot tell them apart, so the
+ * classification is made on stderr, line by line so that a "no subtitles"
+ * notice on one line does not excuse an `ERROR:` on another.
+ *
+ * An exit with no stderr at all counts as a failure: with aborts propagating
+ * separately, what is left are ENOENT (no yt-dlp on PATH) and the execa
+ * timeout, both of which an operator wants to see as subs_status=partial.
+ */
+export function isRealYtDlpFailure(stderr: string | undefined): boolean {
+  if (!stderr?.trim()) {
+    return true;
+  }
+  return stderr
+    .split("\n")
+    .some((line) => REAL_FAILURE.test(line) && !NO_SUBTITLES.test(line));
+}
+
+/**
+ * yt-dlp exits non-zero both when a video carries no track of the kind asked
+ * for and when it actually failed, so the exit is classified on stderr and
+ * whatever landed on disk is read anyway — a throw here must not cost us the
+ * metadata yt-dlp wrote before it, nor the other pass.
  */
 async function runYtDlpPass(
   url: string,
@@ -235,17 +262,23 @@ async function runYtDlpPass(
   try {
     await execa("yt-dlp", args, {
       cancelSignal: abortSignal,
-      timeout: 60_000,
+      // Half the job's budget, so a stuck pass still leaves the job time to
+      // run the other one and store what it got.
+      timeout: Math.floor(
+        Math.min(60_000, (serverConfig.crawler.jobTimeoutSec * 1000) / 2),
+      ),
     });
   } catch (e) {
     // A video with no track of the kind asked for also exits non-zero, so
-    // this is not conclusive on its own: it only downgrades the outcome if
-    // no track is found on either pass.
-    failed = true;
+    // the exit code is not conclusive: stderr is what separates "this video
+    // has no captions" from "yt-dlp was throttled".
+    failed = isRealYtDlpFailure((e as { stderr?: string }).stderr);
     logger.warn(
       `[Crawler][${jobId}] yt-dlp ${
         opts.auto ? "auto" : "manual"
-      } pass exited non-zero for "${url}": ${e}`,
+      } pass exited non-zero for "${url}"${
+        failed ? "" : " (no subtitles of that kind)"
+      }: ${e}`,
     );
   }
 
@@ -283,7 +316,8 @@ async function runYtDlpPass(
  *
  * Returns null only when there is no `.info.json` at all — yt-dlp failed
  * outright — so that the caller can fall back to the normal browser crawl.
- * Never throws.
+ * The one thing it does throw on is an abort: a cancelled job must not be
+ * finished off with whatever half of the passes managed to produce.
  */
 export async function extractYouTubeContent(
   url: string,
@@ -327,14 +361,21 @@ export async function extractYouTubeContent(
       }
     }
 
-    return {
+    const content: YouTubeContent = {
       ...first.info,
       transcript: track?.transcript ?? "",
       subs,
       lang: track?.lang ?? null,
       failed,
     };
+    // An abort during a pass is swallowed into `failed` above, which would
+    // otherwise store a partial result for a job that was told to stop.
+    abortSignal.throwIfAborted();
+    return content;
   } catch (e) {
+    if (abortSignal.aborted) {
+      throw e;
+    }
     logger.warn(
       `[Crawler][${jobId}] YouTube extraction failed for "${url}": ${e}`,
     );

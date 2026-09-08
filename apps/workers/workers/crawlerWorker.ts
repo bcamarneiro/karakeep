@@ -439,6 +439,9 @@ async function runCrawler(
       await enqueuePostCrawlJobs(job, bookmarkId, userId, url);
       return { status: "completed" };
     }
+    // Falling back means starting a fresh browser crawl; if the job was
+    // cancelled while yt-dlp ran, stop here instead of opening a tab.
+    job.abortSignal.throwIfAborted();
     logger.warn(
       `[Crawler][${jobId}] yt-dlp yielded nothing for "${truncateUrl(
         url,

@@ -87,6 +87,7 @@ import {
   extractYouTubeContent,
   formatTimestamp,
   handleYouTubeBookmark,
+  isRealYtDlpFailure,
   isYouTubeUrl,
   parseInfoJson,
 } from "./youtube";
@@ -122,6 +123,10 @@ function ytDlpWrites(opts: {
   manual?: Record<string, string>;
   auto?: Record<string, string>;
   fail?: boolean;
+  /** Write everything, then exit non-zero with this on stderr. */
+  stderrFail?: string;
+  /** Called before each pass; used to abort mid-run. */
+  onPass?: (auto: boolean) => void;
 }) {
   vi.mocked(execa).mockImplementation((async (
     _file: string,
@@ -132,6 +137,7 @@ function ytDlpWrites(opts: {
     }
     const dir = dirname(args[args.indexOf("-o") + 1]);
     const auto = args.includes("--write-auto-subs");
+    opts.onPass?.(auto);
     if (args.includes("--write-info-json")) {
       const info = opts.info === undefined ? INFO : opts.info;
       if (info !== null) {
@@ -142,6 +148,9 @@ function ytDlpWrites(opts: {
       (auto ? opts.auto : opts.manual) ?? {},
     )) {
       await writeFile(join(dir, name), body);
+    }
+    if (opts.stderrFail !== undefined) {
+      throw Object.assign(new Error("exit 1"), { stderr: opts.stderrFail });
     }
     return {};
   }) as unknown as typeof execa);
@@ -322,6 +331,52 @@ describe("extractYouTubeContent", () => {
     });
   });
 
+  it("a non-zero exit that only says 'no subtitles' is not a failure", async () => {
+    ytDlpWrites({
+      stderrFail:
+        "WARNING: [youtube] abc: There are no subtitles for the requested languages",
+    });
+    const res = await extractYouTubeContent(
+      "https://www.youtube.com/watch?v=x",
+      "job1",
+      noProxy,
+      signal(),
+    );
+    expect(res).toMatchObject({ subs: "none", failed: false });
+  });
+
+  it("a non-zero exit that says the request was throttled is a failure", async () => {
+    ytDlpWrites({ stderrFail: "ERROR: HTTP Error 429: Too Many Requests" });
+    const res = await extractYouTubeContent(
+      "https://www.youtube.com/watch?v=x",
+      "job1",
+      noProxy,
+      signal(),
+    );
+    expect(res).toMatchObject({ subs: "none", failed: true });
+  });
+
+  it("propagates an abort raised during the second pass", async () => {
+    const controller = new AbortController();
+    ytDlpWrites({
+      auto: { "yt.en.vtt": vtt("hello world") },
+      onPass: (auto) => {
+        if (auto) {
+          controller.abort();
+        }
+      },
+    });
+    // A cancelled job must reject, not quietly store half a transcript.
+    await expect(
+      extractYouTubeContent(
+        "https://www.youtube.com/watch?v=x",
+        "job1",
+        noProxy,
+        controller.signal,
+      ),
+    ).rejects.toThrow();
+  });
+
   it("returns null when yt-dlp writes no info.json at all", async () => {
     ytDlpWrites({ info: null });
     await expect(
@@ -392,6 +447,47 @@ describe("extractYouTubeContent", () => {
     expect(args[args.indexOf("--cookies") + 1]).toBe(
       join(passDir, "cookies.txt"),
     );
+  });
+});
+
+describe("isRealYtDlpFailure", () => {
+  it("treats throttling, server errors and generic errors as failures", () => {
+    expect(isRealYtDlpFailure("ERROR: HTTP Error 429: Too Many Requests")).toBe(
+      true,
+    );
+    expect(
+      isRealYtDlpFailure("ERROR: HTTP Error 503: Service Unavailable"),
+    ).toBe(true);
+    expect(
+      isRealYtDlpFailure("ERROR: Sign in to confirm you're not a bot"),
+    ).toBe(true);
+    expect(isRealYtDlpFailure("WARNING: Unable to download webpage")).toBe(
+      true,
+    );
+  });
+
+  it("does not treat a video without the requested captions as a failure", () => {
+    expect(
+      isRealYtDlpFailure(
+        "WARNING: [youtube] abc123: There are no subtitles for the requested languages",
+      ),
+    ).toBe(false);
+    expect(isRealYtDlpFailure("WARNING: video has no subtitles")).toBe(false);
+    expect(isRealYtDlpFailure("WARNING: there are no automatic captions")).toBe(
+      false,
+    );
+  });
+
+  it("classifies line by line, and calls a silent non-zero exit a failure", () => {
+    // A "no subtitles" notice on one line must not excuse an ERROR on another.
+    expect(
+      isRealYtDlpFailure(
+        "WARNING: There are no subtitles for the requested languages\nERROR: HTTP Error 429",
+      ),
+    ).toBe(true);
+    // ENOENT and the execa timeout leave nothing on stderr; both are real.
+    expect(isRealYtDlpFailure(undefined)).toBe(true);
+    expect(isRealYtDlpFailure("   ")).toBe(true);
   });
 });
 
