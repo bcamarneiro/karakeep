@@ -101,6 +101,7 @@ export const zAssetTypesSchema = z.enum([
   "pdf",
   "assetScreenshot",
   "bannerImage",
+  "linkImage",
   "fullPageArchive",
   "video",
   "bookmarkAsset",
