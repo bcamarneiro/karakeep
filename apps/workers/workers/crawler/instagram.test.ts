@@ -79,11 +79,10 @@ import {
   instagramMarker,
   isInstagramUrl,
   parseInstagramDump,
-  parseVtt,
-  privateYtDlpArgs,
   transcribeInstagramAudio,
 } from "./instagram";
 import { InstagramTransientError } from "./instagramPage";
+import { privateYtDlpArgs } from "./ytDlp";
 
 /** Point InferenceClientFactory at a stub whose transcribeAudio we control. */
 function stubTranscriber(impl: (file: string) => Promise<string | null>) {
@@ -124,62 +123,6 @@ describe("isInstagramUrl", () => {
       false,
     );
     expect(isInstagramUrl("not a url")).toBe(false);
-  });
-});
-
-describe("parseVtt", () => {
-  it("extracts spoken text, dropping timestamps and duplicates", () => {
-    const vtt = [
-      "WEBVTT",
-      "",
-      "00:00:00.000 --> 00:00:02.000",
-      "hello world",
-      "",
-      "00:00:02.000 --> 00:00:04.000",
-      "hello world",
-      "",
-      "00:00:04.000 --> 00:00:06.000",
-      "second line",
-      "",
-    ].join("\n");
-    expect(parseVtt(vtt)).toBe("hello world second line");
-  });
-
-  it("returns empty string for headerless or empty input", () => {
-    expect(parseVtt("")).toBe("");
-    expect(parseVtt("WEBVTT\n\n")).toBe("");
-  });
-
-  it("drops header metadata that yt-dlp writes above the first cue", () => {
-    const vtt = [
-      "WEBVTT",
-      "Kind: captions",
-      "Language: en-US",
-      "X-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000",
-      "",
-      "00:00:00.000 --> 00:00:02.000",
-      "spoken words",
-      "",
-    ].join("\n");
-    expect(parseVtt(vtt)).toBe("spoken words");
-  });
-
-  it("drops non-numeric cue identifiers and comment blocks", () => {
-    const vtt = [
-      "WEBVTT",
-      "",
-      "NOTE this file was machine generated",
-      "",
-      "intro",
-      "00:00:00.000 --> 00:00:02.000",
-      "spoken words",
-      "",
-      "cue-2",
-      "00:00:02.000 --> 00:00:04.000",
-      "more words",
-      "",
-    ].join("\n");
-    expect(parseVtt(vtt)).toBe("spoken words more words");
   });
 });
 

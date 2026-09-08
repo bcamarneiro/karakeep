@@ -29,15 +29,6 @@ import {
 import { parseVtt } from "./vtt";
 import { privateYtDlpArgs } from "./ytDlp";
 
-// Instagram was the first caller of the WebVTT parser; it now lives in
-// ./vtt so the YouTube path can share it. Re-exported here so importers
-// (and this module's own tests) keep working against the old path.
-export { parseVtt };
-
-// privateYtDlpArgs moved to ./ytDlp so the YouTube path shares it; the
-// configured cookie jar must never be handed to yt-dlp raw, on any path.
-export { privateYtDlpArgs };
-
 const INSTAGRAM_MEDIA_TYPES = new Set(["p", "reel", "reels", "tv"]);
 
 export interface InstagramExtractionStats {
