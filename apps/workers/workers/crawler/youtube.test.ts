@@ -1,4 +1,5 @@
-import { writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -364,6 +365,33 @@ describe("extractYouTubeContent", () => {
       expect.arrayContaining(["--sleep-requests", "1", "--proxy"]),
     );
     expect(args.slice(-2)).toEqual(["--", "https://www.youtube.com/watch?v=x"]);
+  });
+
+  it("hands yt-dlp a private copy of the cookie jar, never the configured one", async () => {
+    // yt-dlp rewrites the jar it is given, so a YouTube pass pointed at the
+    // shared jar writes .youtube.com cookies into Instagram's session file.
+    ytDlpWrites({ manual: { "yt.pt.vtt": vtt("olá") } });
+    const jarDir = await mkdtemp(join(tmpdir(), "karakeep-yt-jar-"));
+    const jar = join(jarDir, "instagram.txt");
+    await writeFile(jar, "# Netscape HTTP Cookie File\n");
+    const before = serverConfig.crawler.ytDlpArguments;
+    serverConfig.crawler.ytDlpArguments = ["--cookies", jar];
+    try {
+      await extractYouTubeContent(
+        "https://www.youtube.com/watch?v=x",
+        "job1",
+        noProxy,
+        signal(),
+      );
+    } finally {
+      serverConfig.crawler.ytDlpArguments = before;
+      await rm(jarDir, { recursive: true, force: true });
+    }
+    const args = vi.mocked(execa).mock.calls[0][1] as string[];
+    const passDir = dirname(args[args.indexOf("-o") + 1]);
+    expect(args[args.indexOf("--cookies") + 1]).toBe(
+      join(passDir, "cookies.txt"),
+    );
   });
 });
 

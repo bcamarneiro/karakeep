@@ -1,5 +1,5 @@
 import { createWriteStream } from "node:fs";
-import { copyFile, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Transform } from "node:stream";
@@ -24,11 +24,16 @@ import {
   parseInstagramPage,
 } from "./instagramPage";
 import { parseVtt } from "./vtt";
+import { privateYtDlpArgs } from "./ytDlp";
 
 // Instagram was the first caller of the WebVTT parser; it now lives in
 // ./vtt so the YouTube path can share it. Re-exported here so importers
 // (and this module's own tests) keep working against the old path.
 export { parseVtt };
+
+// privateYtDlpArgs moved to ./ytDlp so the YouTube path shares it; the
+// configured cookie jar must never be handed to yt-dlp raw, on any path.
+export { privateYtDlpArgs };
 
 const INSTAGRAM_MEDIA_TYPES = new Set(["p", "reel", "reels", "tv"]);
 
@@ -152,32 +157,6 @@ export async function parseInstagramDump(
     author: info.uploader ?? info.channel ?? null,
     date: info.upload_date ?? null,
   };
-}
-
-/**
- * yt-dlp rewrites the cookie jar it is given when it exits, and Instagram's
- * response to a burst of requests can be a Set-Cookie that drops the session
- * — after which the jar on disk is logged out for good. Hand yt-dlp a private
- * copy inside the job's temp dir instead, so the configured jar is only ever
- * read. Any `--cookies <path>` in CRAWLER_YTDLP_ARGS is redirected; other
- * arguments pass through untouched.
- */
-export async function privateYtDlpArgs(dir: string): Promise<string[]> {
-  const args = [...serverConfig.crawler.ytDlpArguments];
-  const i = args.indexOf("--cookies");
-  if (i === -1 || i + 1 >= args.length) {
-    return args;
-  }
-  const copy = join(dir, "cookies.txt");
-  try {
-    await copyFile(args[i + 1], copy);
-    args[i + 1] = copy;
-  } catch (e) {
-    // A missing or unreadable jar is a configuration problem yt-dlp will
-    // report on its own; don't mask it by silently running without cookies.
-    logger.warn(`[Crawler] Could not copy the yt-dlp cookie jar: ${e}`);
-  }
-  return args;
 }
 
 async function transcribeAudioFile(

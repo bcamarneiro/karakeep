@@ -24,6 +24,7 @@ import logger from "@karakeep/shared/logger";
 import { updateAsset } from "../../workerUtils";
 import { storeHtmlContent } from "./assetStorage";
 import { parseVtt } from "./vtt";
+import { privateYtDlpArgs } from "./ytDlp";
 
 export interface YouTubeChapter {
   title: string;
@@ -224,7 +225,8 @@ async function runYtDlpPass(
     "--no-playlist",
     "-o",
     join(dir, "yt"),
-    ...serverConfig.crawler.ytDlpArguments,
+    // Never the configured jar itself: yt-dlp rewrites what it is given.
+    ...(await privateYtDlpArgs(dir)),
     ...(proxy ? ["--proxy", proxy] : []),
     "--",
     url,
