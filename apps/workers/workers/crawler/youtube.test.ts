@@ -111,6 +111,9 @@ const INFO = {
     { title: "Intro", start_time: 0 },
     { title: "The meat", start_time: 65 },
   ],
+  // yt-dlp lists every auto-caption language in the info.json; the second
+  // pass is only worth running when one of them is a language we asked for.
+  automatic_captions: { en: [{ ext: "vtt" }], pt: [{ ext: "vtt" }] },
 };
 
 /**
@@ -173,6 +176,8 @@ describe("isYouTubeUrl", () => {
     expect(isYouTubeUrl("https://youtu.be/dQw4w9WgXcQ")).toBe(true);
     expect(isYouTubeUrl("https://www.youtube.com/shorts/abc123")).toBe(true);
     expect(isYouTubeUrl("https://m.youtube.com/watch?v=abc123")).toBe(true);
+    expect(isYouTubeUrl("https://www.youtube.com/live/abc123")).toBe(true);
+    expect(isYouTubeUrl("https://www.youtube.com/embed/abc123")).toBe(true);
   });
 
   it("rejects non-video, non-youtube and lookalike hosts", () => {
@@ -183,6 +188,10 @@ describe("isYouTubeUrl", () => {
     );
     expect(isYouTubeUrl("https://notyoutube.com/watch?v=abc")).toBe(false);
     expect(isYouTubeUrl("https://youtu.be/")).toBe(false);
+    // A playlist wearing an embed URL: no single video to describe.
+    expect(
+      isYouTubeUrl("https://www.youtube.com/embed/videoseries?list=PL123"),
+    ).toBe(false);
     expect(isYouTubeUrl("not a url")).toBe(false);
   });
 });
@@ -199,6 +208,7 @@ describe("parseInfoJson", () => {
         { title: "Intro", startTime: 0 },
         { title: "The meat", startTime: 65 },
       ],
+      autoCaptionLangs: ["en", "pt"],
     });
   });
 
@@ -210,6 +220,7 @@ describe("parseInfoJson", () => {
       uploadDate: null,
       chapters: [],
       durationSec: null,
+      autoCaptionLangs: [],
     });
   });
 
@@ -273,6 +284,20 @@ describe("extractYouTubeContent", () => {
     const second = vi.mocked(execa).mock.calls[1][1] as string[];
     expect(second).toContain("--write-auto-subs");
     expect(second).not.toContain("--write-info-json");
+  });
+
+  it("skips the auto pass when the video has no caption language we asked for", async () => {
+    // The info.json already says which auto captions exist; when none of them
+    // matches, a second request to YouTube could only come back empty.
+    ytDlpWrites({ info: { ...INFO, automatic_captions: { fr: [] } } });
+    const res = await extractYouTubeContent(
+      "https://www.youtube.com/watch?v=x",
+      "job1",
+      noProxy,
+      signal(),
+    );
+    expect(res).toMatchObject({ subs: "none", lang: null, failed: false });
+    expect(vi.mocked(execa)).toHaveBeenCalledTimes(1);
   });
 
   it("honours the configured language order among manual tracks", async () => {

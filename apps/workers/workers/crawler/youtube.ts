@@ -42,6 +42,16 @@ export interface YouTubeInfo {
   durationSec: number | null;
 }
 
+/**
+ * What `parseInfoJson` reads, which is the content fields plus the one piece
+ * of routing information: which automatic caption languages the video has.
+ * That is not part of the stored content, so it is kept off `YouTubeInfo`.
+ */
+export interface ParsedYouTubeInfo extends YouTubeInfo {
+  /** The language tags under `automatic_captions`, e.g. ["en", "pt"]. */
+  autoCaptionLangs: string[];
+}
+
 export interface YouTubeContent extends YouTubeInfo {
   transcript: string;
   /** Which kind of subtitle track the text came from. */
@@ -79,6 +89,11 @@ export function isYouTubeUrl(url: string): boolean {
     if (parsed.pathname === "/watch") {
       return !!parsed.searchParams.get("v");
     }
+    // `/embed/videoseries?list=…` is a playlist wearing an embed URL: there
+    // is no single video behind it for yt-dlp to describe.
+    if (/^\/embed\/videoseries(\/|$)/.test(parsed.pathname)) {
+      return false;
+    }
     return /^\/(shorts|live|embed)\/[^/]+/.test(parsed.pathname);
   }
   if (/(^|\.)youtu\.be$/.test(host)) {
@@ -110,19 +125,38 @@ function langOf(file: string): string | null {
  * carry text. Tracks matching no selector sort last — they still beat no
  * transcript at all.
  */
+function langSpecs(langs: string): string[] {
+  return langs
+    .split(",")
+    .map((l) => l.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+/**
+ * The index of the first selector a language tag matches, or -1 for none.
+ * A trailing `.*` is a prefix match ("pt.*" covers `pt`, `pt-BR`, `pt-orig`);
+ * anything else is matched literally.
+ */
+function langRank(lang: string, specs: string[]): number {
+  const l = lang.toLowerCase();
+  return specs.findIndex((spec) =>
+    spec.endsWith(".*") ? l.startsWith(spec.slice(0, -2)) : l === spec,
+  );
+}
+
+/** Whether any of these language tags is one the configuration asked for. */
+export function hasPreferredLang(tags: string[], langs: string): boolean {
+  const specs = langSpecs(langs);
+  return tags.some((t) => langRank(t, specs) !== -1);
+}
+
 export function orderSubtitleFiles(
   files: string[],
   langs: string,
 ): { file: string; lang: string }[] {
-  const specs = langs
-    .split(",")
-    .map((l) => l.trim().toLowerCase())
-    .filter(Boolean);
+  const specs = langSpecs(langs);
   const rank = ({ lang }: { lang: string }) => {
-    const l = lang.toLowerCase();
-    const i = specs.findIndex((spec) =>
-      spec.endsWith(".*") ? l.startsWith(spec.slice(0, -2)) : l === spec,
-    );
+    const i = langRank(lang, specs);
     return i === -1 ? specs.length : i;
   };
   return (
@@ -140,7 +174,7 @@ export function orderSubtitleFiles(
  * them is optional there — a livestream has no upload date, most videos have
  * no chapters — so each is defaulted rather than assumed.
  */
-export function parseInfoJson(raw: string): YouTubeInfo | null {
+export function parseInfoJson(raw: string): ParsedYouTubeInfo | null {
   interface RawInfo {
     title?: string;
     description?: string;
@@ -149,6 +183,7 @@ export function parseInfoJson(raw: string): YouTubeInfo | null {
     upload_date?: string;
     duration?: number;
     chapters?: { title?: string; start_time?: number }[] | null;
+    automatic_captions?: Record<string, unknown> | null;
   }
   let info: RawInfo;
   try {
@@ -169,12 +204,13 @@ export function parseInfoJson(raw: string): YouTubeInfo | null {
     uploadDate: info.upload_date ?? null,
     chapters,
     durationSec: typeof info.duration === "number" ? info.duration : null,
+    autoCaptionLangs: Object.keys(info.automatic_captions ?? {}),
   };
 }
 
 interface PassResult {
   track: { transcript: string; lang: string } | null;
-  info: YouTubeInfo | null;
+  info: ParsedYouTubeInfo | null;
   /** yt-dlp itself misbehaved, as opposed to the video having no such track. */
   failed: boolean;
 }
@@ -284,7 +320,7 @@ async function runYtDlpPass(
 
   const files = await readdir(dir);
 
-  let info: YouTubeInfo | null = null;
+  let info: ParsedYouTubeInfo | null = null;
   if (opts.info) {
     const infoName = files.find((f) => f.endsWith(".info.json"));
     if (infoName) {
@@ -344,7 +380,15 @@ export async function extractYouTubeContent(
     let subs: YouTubeContent["subs"] = track ? "manual" : "none";
     let failed = track ? false : first.failed;
 
-    if (!track && !abortSignal.aborted) {
+    // The info.json lists which automatic caption languages exist. If none of
+    // them is one we asked for, the second pass can only come back empty, so
+    // it is not worth a second request to YouTube.
+    const autoWorthTrying = hasPreferredLang(
+      first.info.autoCaptionLangs,
+      serverConfig.crawler.youtubeSubLangs,
+    );
+
+    if (!track && autoWorthTrying && !abortSignal.aborted) {
       const second = await ytDlpPass(
         url,
         jobId,
@@ -361,8 +405,9 @@ export async function extractYouTubeContent(
       }
     }
 
+    const { autoCaptionLangs: _autoCaptionLangs, ...info } = first.info;
     const content: YouTubeContent = {
-      ...first.info,
+      ...info,
       transcript: track?.transcript ?? "",
       subs,
       lang: track?.lang ?? null,
