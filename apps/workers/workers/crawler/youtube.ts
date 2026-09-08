@@ -141,10 +141,44 @@ function langRank(lang: string, specs: string[]): number {
   );
 }
 
-/** Whether any of these language tags is one the configuration asked for. */
-export function hasPreferredLang(tags: string[], langs: string): boolean {
+/**
+ * Whether a selector is one `langRank` can actually reason about: a bare tag
+ * or a `xx.*` prefix. `CRAWLER_YOUTUBE_SUB_LANGS` is passed to yt-dlp, whose
+ * syntax is wider than that — `all`, exclusions like `-live_chat`, and
+ * arbitrary regexes are all valid there and none of them means what a literal
+ * comparison would make of it.
+ */
+const PREFIX_SELECTOR = /^[A-Za-z-]+(\.\*)?$/;
+
+function isPrefixSelector(spec: string): boolean {
+  return spec !== "all" && !spec.startsWith("-") && PREFIX_SELECTOR.test(spec);
+}
+
+/**
+ * Whether the info.json positively rules out the automatic-caption pass, so
+ * that it can be skipped without risking a transcript.
+ *
+ * The bar is deliberately high, because the cost of being wrong is asymmetric:
+ * a needless second pass costs one request, while a wrongly skipped one loses
+ * the transcript silently, as `subs=none failed=false`. So this answers "yes,
+ * skip" only when yt-dlp actually told us the languages (an absent or empty
+ * `automatic_captions` is no information, not an empty set), when every
+ * configured selector is one we can compare (`all` or an exclusion would make
+ * a literal comparison meaningless), and when none of the listed languages
+ * ranks. Anything else runs the pass, exactly as before the gate existed.
+ */
+export function autoCaptionsRuleOutSecondPass(
+  tags: string[],
+  langs: string,
+): boolean {
+  if (tags.length === 0) {
+    return false;
+  }
   const specs = langSpecs(langs);
-  return tags.some((t) => langRank(t, specs) !== -1);
+  if (specs.length === 0 || !specs.every(isPrefixSelector)) {
+    return false;
+  }
+  return tags.every((t) => langRank(t, specs) === -1);
 }
 
 export function orderSubtitleFiles(
@@ -377,15 +411,16 @@ export async function extractYouTubeContent(
     let subs: YouTubeContent["subs"] = track ? "manual" : "none";
     let failed = track ? false : first.failed;
 
-    // The info.json lists which automatic caption languages exist. If none of
-    // them is one we asked for, the second pass can only come back empty, so
-    // it is not worth a second request to YouTube.
-    const autoWorthTrying = hasPreferredLang(
+    // The info.json usually lists which automatic caption languages exist. If
+    // it says so and none of them is one we asked for, the second pass can
+    // only come back empty and is not worth a request to YouTube. Every other
+    // case — including yt-dlp not telling us — runs it.
+    const ruledOut = autoCaptionsRuleOutSecondPass(
       first.info.autoCaptionLangs,
       serverConfig.crawler.youtubeSubLangs,
     );
 
-    if (!track && autoWorthTrying && !abortSignal.aborted) {
+    if (!track && !ruledOut && !abortSignal.aborted) {
       const second = await ytDlpPass(
         url,
         jobId,
@@ -489,8 +524,11 @@ export function composeYouTubeHtml(content: YouTubeContent): string {
   const date = content.uploadDate
     ? content.uploadDate.replace(/^(\d{4})(\d{2})(\d{2})$/, "$1-$2-$3")
     : null;
-  const duration =
-    content.durationSec !== null ? formatTimestamp(content.durationSec) : null;
+  // A zero duration is yt-dlp saying it does not know (a livestream), not a
+  // zero-second video, so it is left out rather than rendered as "0:00".
+  const duration = content.durationSec
+    ? formatTimestamp(content.durationSec)
+    : null;
   const footer = [content.channel, date, duration].filter(Boolean).join(" · ");
   if (footer) {
     parts.push(`<p><small>${escapeHtml(footer)}</small></p>`);

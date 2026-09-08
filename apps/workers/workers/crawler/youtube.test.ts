@@ -301,6 +301,46 @@ describe("extractYouTubeContent", () => {
     expect(vi.mocked(execa)).toHaveBeenCalledTimes(1);
   });
 
+  it("still runs the auto pass when the info.json lists no captions at all", async () => {
+    // An absent `automatic_captions` is yt-dlp telling us nothing, not telling
+    // us there is nothing. Skipping here would lose the transcript silently.
+    const { automatic_captions: _dropped, ...noCaptionKey } = INFO;
+    ytDlpWrites({
+      info: noCaptionKey,
+      auto: { "yt.en.vtt": vtt("hello world") },
+    });
+    const res = await extractYouTubeContent(
+      "https://www.youtube.com/watch?v=x",
+      "job1",
+      noProxy,
+      signal(),
+    );
+    expect(res).toMatchObject({
+      transcript: "hello world",
+      subs: "auto",
+      lang: "en",
+    });
+    expect(vi.mocked(execa)).toHaveBeenCalledTimes(2);
+  });
+
+  it("still runs the auto pass for a selector it cannot compare, like `all`", async () => {
+    // "all" and exclusions such as "-live_chat" are valid yt-dlp syntax that a
+    // literal comparison would read as a language tag, ranking nothing.
+    serverConfig.crawler.youtubeSubLangs = "all";
+    ytDlpWrites({
+      info: { ...INFO, automatic_captions: { fr: [] } },
+      auto: { "yt.fr.vtt": vtt("bonjour") },
+    });
+    const res = await extractYouTubeContent(
+      "https://www.youtube.com/watch?v=x",
+      "job1",
+      noProxy,
+      signal(),
+    );
+    expect(res).toMatchObject({ transcript: "bonjour", subs: "auto" });
+    expect(vi.mocked(execa)).toHaveBeenCalledTimes(2);
+  });
+
   it("honours the configured language order among manual tracks", async () => {
     ytDlpWrites({
       manual: {
@@ -562,6 +602,12 @@ describe("composeYouTubeHtml", () => {
         "<!-- karakeep-yt subs=manual lang=pt status=ok -->",
       ].join("\n"),
     );
+  });
+
+  it("leaves a zero duration out of the footer", () => {
+    // yt-dlp reports 0 for a livestream: unknown, not a zero-second video.
+    const html = composeYouTubeHtml({ ...CONTENT, durationSec: 0 });
+    expect(html).toContain("<p><small>Some Channel · 2026-01-15</small></p>");
   });
 
   it("omits the sections it has nothing for and marks a failed sub fetch", () => {
