@@ -12,16 +12,70 @@ vi.mock("@karakeep/shared/inference", () => ({
   InferenceClientFactory: { build: vi.fn() },
 }));
 
+/**
+ * Enough of drizzle's builder to record the asset bookkeeping the store does:
+ * the rows it reads back for the previous gallery, the delete that drops
+ * them, and the inserts for the new slides. `dbEvents` keeps the order, so a
+ * test can prove the delete lands before the first insert.
+ */
+const existingAssetRows: { id: string }[] = [];
+const insertedAssets: Record<string, unknown>[] = [];
+const dbEvents: string[] = [];
+const bookmarkUpdates: Record<string, unknown>[] = [];
+
+const builder = {
+  findMany: () => Promise.resolve([...existingAssetRows]),
+  insert: () => ({
+    values: (v: Record<string, unknown>) => {
+      dbEvents.push("insert");
+      insertedAssets.push(v);
+      return Promise.resolve();
+    },
+  }),
+  delete: () => ({
+    where: () => {
+      dbEvents.push("delete");
+      return Promise.resolve();
+    },
+  }),
+  update: () => ({
+    set: (v: Record<string, unknown>) => {
+      bookmarkUpdates.push(v);
+      return { where: () => Promise.resolve({ changes: 1 }) };
+    },
+  }),
+};
+
+vi.mock("@karakeep/db", () => ({
+  db: {
+    // All deferred: the factory runs before `builder` is initialised.
+    query: { assets: { findMany: () => builder.findMany() } },
+    insert: () => builder.insert(),
+    delete: () => builder.delete(),
+    update: () => builder.update(),
+  },
+}));
+
+vi.mock("@karakeep/shared/assetdb", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  silentDeleteAsset: vi.fn(),
+}));
+
+vi.mock("./assetStorage", () => ({ storeImageBytes: vi.fn() }));
+
 import { execa } from "execa";
 import { fetchWithProxy } from "network";
 
+import { silentDeleteAsset } from "@karakeep/shared/assetdb";
 import serverConfig from "@karakeep/shared/config";
 import { InferenceClientFactory } from "@karakeep/shared/inference";
 
+import { storeImageBytes } from "./assetStorage";
 import {
   composeInstagramHtml,
   extractInstagramContent,
   extractionStatus,
+  handleInstagramBookmark,
   instagramMarker,
   isInstagramUrl,
   parseInstagramDump,
@@ -600,7 +654,7 @@ describe("extractInstagramContent (page)", () => {
       date: "20260819",
       stats: {
         path: "page",
-        images: { expected: 2, got: 2 },
+        images: { expected: 2, got: 2, stored: 0 },
         videos: { expected: 1, got: 0 },
       },
     });
@@ -815,7 +869,11 @@ describe("extractInstagramContent (page)", () => {
     );
     expect(content?.caption).toBe("carousel caption");
     expect(content?.images).toEqual(["May be an image of text — first", ""]);
-    expect(content?.stats?.images).toEqual({ expected: 2, got: 1 });
+    expect(content?.stats?.images).toEqual({
+      expected: 2,
+      got: 1,
+      stored: 0,
+    });
     expect(execa).not.toHaveBeenCalled(); // no yt-dlp fallback after an abort
   });
 
@@ -846,7 +904,11 @@ describe("extractInstagramContent (page)", () => {
       "second alt text",
     ]);
     // The second image's alt text is kept, but nothing was processed for it.
-    expect(content?.stats?.images).toEqual({ expected: 2, got: 1 });
+    expect(content?.stats?.images).toEqual({
+      expected: 2,
+      got: 1,
+      stored: 0,
+    });
   });
 
   it("does not retry via yt-dlp audio when the job is aborted mid-transcription", async () => {
@@ -1047,7 +1109,7 @@ describe("extractInstagramContent (page)", () => {
     expect(content?.images).toEqual(["first alt text", ""]);
     expect(content?.stats).toEqual({
       path: "page",
-      images: { expected: 2, got: 2 },
+      images: { expected: 2, got: 2, stored: 0 },
       videos: { expected: 0, got: 0 },
     });
     expect(extractionStatus(content!.stats!)).toBe("ok");
@@ -1177,12 +1239,12 @@ describe("extraction stats", () => {
   it("marks a post partial when a video produced no transcript", () => {
     const stats = {
       path: "page" as const,
-      images: { expected: 2, got: 2 },
+      images: { expected: 2, got: 2, stored: 0 },
       videos: { expected: 1, got: 0 },
     };
     expect(extractionStatus(stats)).toBe("partial");
     expect(instagramMarker(stats)).toBe(
-      "<!-- karakeep-ig path=page images=2/2 videos=0/1 status=partial -->",
+      "<!-- karakeep-ig path=page images=2/2 stored=0 videos=0/1 status=partial -->",
     );
   });
 
@@ -1190,7 +1252,7 @@ describe("extraction stats", () => {
     expect(
       extractionStatus({
         path: "page",
-        images: { expected: 0, got: 0 },
+        images: { expected: 0, got: 0, stored: 0 },
         videos: { expected: 1, got: 1 },
       }),
     ).toBe("ok");
@@ -1206,14 +1268,313 @@ describe("extraction stats", () => {
       date: null,
       stats: {
         path: "page",
-        images: { expected: 2, got: 1 },
+        images: { expected: 2, got: 1, stored: 0 },
         videos: { expected: 0, got: 0 },
       },
     });
     expect(
       html.endsWith(
-        "<!-- karakeep-ig path=page images=1/2 videos=0/0 status=partial -->",
+        "<!-- karakeep-ig path=page images=1/2 stored=0 videos=0/0 status=partial -->",
       ),
     ).toBe(true);
+  });
+});
+
+describe("storing Instagram images as assets", () => {
+  const proxy = {
+    httpProxy: undefined,
+    httpsProxy: undefined,
+    noProxy: undefined,
+  };
+  const signal = new AbortController().signal;
+  const savedCrawler = { ...serverConfig.crawler };
+  const savedMaxAssetSizeMb = serverConfig.maxAssetSizeMb;
+  // The top-level config fields are readonly to callers; a test still has to
+  // move the size cap, the way the others move `serverConfig.crawler.*`.
+  const mutableConfig = serverConfig as { maxAssetSizeMb: number };
+  const target = { bookmarkId: "bm1", userId: "u1" };
+
+  beforeEach(() => {
+    existingAssetRows.length = 0;
+    insertedAssets.length = 0;
+    dbEvents.length = 0;
+    bookmarkUpdates.length = 0;
+    vi.mocked(execa).mockReset();
+    vi.mocked(fetchWithProxy).mockReset();
+    vi.mocked(silentDeleteAsset).mockReset();
+    vi.mocked(InferenceClientFactory.build).mockReset();
+    vi.mocked(InferenceClientFactory.build).mockReturnValue(null);
+    let n = 0;
+    vi.mocked(storeImageBytes).mockReset();
+    vi.mocked(storeImageBytes).mockImplementation(
+      async (image, { contentType, fileName }) => ({
+        assetId: `asset-${++n}`,
+        contentType,
+        fileName,
+        size: image.byteLength,
+      }),
+    );
+    serverConfig.crawler.instagramTranscribe = false;
+    serverConfig.crawler.instagramDescribeImages = false;
+    serverConfig.crawler.instagramStoreImages = true;
+  });
+
+  afterEach(() => {
+    Object.assign(serverConfig.crawler, savedCrawler);
+    mutableConfig.maxAssetSizeMb = savedMaxAssetSizeMb;
+  });
+
+  /** How many times the mocked fetch was asked for a given CDN image. */
+  function fetchesOf(url: string): number {
+    return vi.mocked(fetchWithProxy).mock.calls.filter((c) => c[0] === url)
+      .length;
+  }
+
+  it("stores every image as a linkImage asset of the bookmark", async () => {
+    servePage(imageOnlyCarouselHtml());
+    expect(
+      await handleInstagramBookmark({
+        url: "https://www.instagram.com/p/ABC123/",
+        jobId: "job1",
+        bookmarkId: "bm1",
+        userId: "u1",
+        runProxy: proxy,
+        abortSignal: signal,
+      }),
+    ).toBe(true);
+
+    // One request per image, and the bytes went to the store as they came off
+    // the wire — content type from the response, name from the slide order.
+    expect(fetchesOf("https://cdn/1.jpg")).toBe(1);
+    expect(fetchesOf("https://cdn/2.jpg")).toBe(1);
+    expect(
+      vi.mocked(storeImageBytes).mock.calls.map(([, opts]) => opts),
+    ).toEqual([
+      {
+        userId: "u1",
+        jobId: "job1",
+        contentType: "image/jpeg",
+        fileName: "slide-01.jpg",
+      },
+      {
+        userId: "u1",
+        jobId: "job1",
+        contentType: "image/jpeg",
+        fileName: "slide-02.jpg",
+      },
+    ]);
+    expect(insertedAssets).toEqual([
+      {
+        id: "asset-1",
+        bookmarkId: "bm1",
+        userId: "u1",
+        assetType: "linkImage",
+        contentType: "image/jpeg",
+        fileName: "slide-01.jpg",
+        size: 3,
+      },
+      {
+        id: "asset-2",
+        bookmarkId: "bm1",
+        userId: "u1",
+        assetType: "linkImage",
+        contentType: "image/jpeg",
+        fileName: "slide-02.jpg",
+        size: 3,
+      },
+    ]);
+    // The count reaches the operator through the marker the probe greps.
+    expect(bookmarkUpdates[0].htmlContent).toContain(
+      "images=2/2 stored=2 videos=0/0 status=ok",
+    );
+  });
+
+  it("names the file after the content type the CDN served", async () => {
+    vi.mocked(fetchWithProxy).mockImplementation((async (url: string) => {
+      if (url.startsWith("https://www.instagram.com/")) {
+        return new Response(imageOnlyCarouselHtml(), {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        });
+      }
+      return new Response(new Uint8Array([1, 2, 3]), {
+        status: 200,
+        headers: {
+          "content-type": url.endsWith("1.jpg")
+            ? "image/webp; charset=binary"
+            : "image/png",
+        },
+      });
+    }) as unknown as typeof fetchWithProxy);
+    await extractInstagramContent(
+      "https://www.instagram.com/p/ABC123/",
+      "job1",
+      proxy,
+      signal,
+      target,
+    );
+    expect(
+      vi.mocked(storeImageBytes).mock.calls.map(([, o]) => o.fileName),
+    ).toEqual(["slide-01.webp", "slide-02.png"]);
+  });
+
+  it("fetches each image only once when OCR and storing are both on", async () => {
+    serverConfig.crawler.instagramDescribeImages = true;
+    const inferFromImage = vi.fn(async () => ({
+      response: "ocr",
+      totalTokens: 1,
+    }));
+    vi.mocked(InferenceClientFactory.build).mockReturnValue({
+      inferFromImage,
+    } as unknown as ReturnType<typeof InferenceClientFactory.build>);
+    servePage(imageOnlyCarouselHtml());
+    const content = await extractInstagramContent(
+      "https://www.instagram.com/p/ABC123/",
+      "job1",
+      proxy,
+      signal,
+      target,
+    );
+    expect(fetchesOf("https://cdn/1.jpg")).toBe(1);
+    expect(fetchesOf("https://cdn/2.jpg")).toBe(1);
+    expect(inferFromImage).toHaveBeenCalledTimes(2);
+    expect(storeImageBytes).toHaveBeenCalledTimes(2);
+    expect(content?.stats?.images).toEqual({
+      expected: 2,
+      got: 2,
+      stored: 2,
+    });
+  });
+
+  it("drops the previous gallery before writing the new one", async () => {
+    existingAssetRows.push({ id: "old-1" }, { id: "old-2" });
+    servePage(imageOnlyCarouselHtml());
+    await extractInstagramContent(
+      "https://www.instagram.com/p/ABC123/",
+      "job1",
+      proxy,
+      signal,
+      target,
+    );
+    // Deleted once, before the first row of the replacement lands.
+    expect(dbEvents).toEqual(["delete", "insert", "insert"]);
+    expect(vi.mocked(silentDeleteAsset).mock.calls).toEqual([
+      ["u1", "old-1"],
+      ["u1", "old-2"],
+    ]);
+  });
+
+  it("keeps the previous gallery when nothing could be fetched", async () => {
+    existingAssetRows.push({ id: "old-1" });
+    vi.mocked(fetchWithProxy).mockImplementation((async (url: string) => {
+      if (url.startsWith("https://www.instagram.com/")) {
+        return new Response(imageOnlyCarouselHtml(), {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        });
+      }
+      throw new Error("CDN unreachable");
+    }) as unknown as typeof fetchWithProxy);
+    const content = await extractInstagramContent(
+      "https://www.instagram.com/p/ABC123/",
+      "job1",
+      proxy,
+      signal,
+      target,
+    );
+    expect(dbEvents).toEqual([]);
+    expect(silentDeleteAsset).not.toHaveBeenCalled();
+    // A store-only fetch failure is not a text extraction failure: `got` and
+    // the status the health probe greps must not move.
+    expect(content?.stats?.images).toEqual({
+      expected: 2,
+      got: 2,
+      stored: 0,
+    });
+    expect(extractionStatus(content!.stats!)).toBe("ok");
+  });
+
+  it("skips an image bigger than the asset size cap", async () => {
+    mutableConfig.maxAssetSizeMb = 1;
+    vi.mocked(fetchWithProxy).mockImplementation((async (url: string) => {
+      if (url.startsWith("https://www.instagram.com/")) {
+        return new Response(imageOnlyCarouselHtml(), {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        });
+      }
+      return new Response(
+        url.endsWith("1.jpg")
+          ? new Uint8Array(2 * 1024 * 1024)
+          : new Uint8Array([1, 2, 3]),
+        { status: 200, headers: { "content-type": "image/jpeg" } },
+      );
+    }) as unknown as typeof fetchWithProxy);
+    const content = await extractInstagramContent(
+      "https://www.instagram.com/p/ABC123/",
+      "job1",
+      proxy,
+      signal,
+      target,
+    );
+    expect(
+      vi.mocked(storeImageBytes).mock.calls.map(([, o]) => o.fileName),
+    ).toEqual(["slide-02.jpg"]);
+    expect(content?.stats?.images.stored).toBe(1);
+  });
+
+  it("counts an image the quota refused as not stored", async () => {
+    vi.mocked(storeImageBytes).mockResolvedValueOnce(null);
+    servePage(imageOnlyCarouselHtml());
+    const content = await extractInstagramContent(
+      "https://www.instagram.com/p/ABC123/",
+      "job1",
+      proxy,
+      signal,
+      target,
+    );
+    expect(storeImageBytes).toHaveBeenCalledTimes(2);
+    expect(insertedAssets).toHaveLength(1);
+    expect(content?.stats?.images).toEqual({
+      expected: 2,
+      got: 2,
+      stored: 1,
+    });
+  });
+
+  it("does not store images past the configured cap", async () => {
+    serverConfig.crawler.instagramMaxImages = 1;
+    servePage(imageOnlyCarouselHtml());
+    const content = await extractInstagramContent(
+      "https://www.instagram.com/p/ABC123/",
+      "job1",
+      proxy,
+      signal,
+      target,
+    );
+    expect(fetchesOf("https://cdn/2.jpg")).toBe(0);
+    expect(
+      vi.mocked(storeImageBytes).mock.calls.map(([, o]) => o.fileName),
+    ).toEqual(["slide-01.jpg"]);
+    expect(content?.stats?.images.stored).toBe(1);
+  });
+
+  it("stores nothing and deletes nothing when storing is off", async () => {
+    serverConfig.crawler.instagramStoreImages = false;
+    existingAssetRows.push({ id: "old-1" });
+    servePage(imageOnlyCarouselHtml());
+    const content = await extractInstagramContent(
+      "https://www.instagram.com/p/ABC123/",
+      "job1",
+      proxy,
+      signal,
+      target,
+    );
+    expect(storeImageBytes).not.toHaveBeenCalled();
+    expect(dbEvents).toEqual([]);
+    expect(silentDeleteAsset).not.toHaveBeenCalled();
+    // With neither OCR nor storing asked for, the images are never fetched.
+    expect(fetchesOf("https://cdn/1.jpg")).toBe(0);
+    expect(content?.stats?.images.stored).toBe(0);
   });
 });

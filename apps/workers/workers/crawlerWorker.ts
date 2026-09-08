@@ -401,6 +401,7 @@ async function runCrawler(
         url,
         jobId,
         bookmarkId,
+        userId,
         runProxy,
         abortSignal: job.abortSignal,
       });

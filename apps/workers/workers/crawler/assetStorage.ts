@@ -91,6 +91,59 @@ export async function storeScreenshot(
   );
 }
 
+/**
+ * Store bytes that are already in memory as an asset. The Instagram crawler
+ * has the image in hand (it fetched it for OCR), so neither the streaming
+ * download of `downloadAndStoreFile` nor a second request is wanted — this is
+ * the same quota-check-then-`saveAsset` shape as `storeScreenshot`, with the
+ * content type and file name supplied by the caller.
+ *
+ * A quota refusal is a warn and a `null`, never a throw: one over-quota user
+ * must not fail the crawl that produced the bytes.
+ */
+export async function storeImageBytes(
+  image: Buffer,
+  {
+    userId,
+    jobId,
+    contentType,
+    fileName,
+  }: {
+    userId: string;
+    jobId: string;
+    contentType: string;
+    fileName: string;
+  },
+): Promise<{
+  assetId: string;
+  contentType: string;
+  fileName: string;
+  size: number;
+} | null> {
+  const { data: quotaApproved, error: quotaError } = await tryCatch(
+    QuotaService.checkStorageQuota(db, userId, image.byteLength),
+  );
+  if (quotaError) {
+    logger.warn(
+      `[Crawler][${jobId}] Skipping storage of "${fileName}" due to quota exceeded: ${quotaError.message}`,
+    );
+    return null;
+  }
+
+  const assetId = newAssetId();
+  await saveAsset({
+    userId,
+    assetId,
+    metadata: { contentType, fileName },
+    asset: image,
+    quotaApproved,
+  });
+  logger.info(
+    `[Crawler][${jobId}] Stored "${fileName}" as assetId: ${assetId} (${image.byteLength} bytes)`,
+  );
+  return { assetId, contentType, fileName, size: image.byteLength };
+}
+
 export async function storePdf(
   pdf: Buffer | undefined,
   userId: string,

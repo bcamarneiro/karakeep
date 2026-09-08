@@ -4,13 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { execa } from "execa";
 import type { RunProxyConfig } from "network";
 import { fetchWithProxy } from "network";
 
 import { db } from "@karakeep/db";
-import { bookmarkLinks } from "@karakeep/db/schema";
+import { assets, AssetTypes, bookmarkLinks } from "@karakeep/db/schema";
+import { silentDeleteAsset } from "@karakeep/shared/assetdb";
 import serverConfig from "@karakeep/shared/config";
 import type { InferenceClient } from "@karakeep/shared/inference";
 import { InferenceClientFactory } from "@karakeep/shared/inference";
@@ -18,6 +19,7 @@ import logger from "@karakeep/shared/logger";
 import { escapeHtml } from "@karakeep/shared/utils/htmlUtils";
 import { buildOCRPrompt } from "@karakeep/shared/prompts";
 
+import { storeImageBytes } from "./assetStorage";
 import type { InstagramMediaItem } from "./instagramPage";
 import {
   fetchInstagramPage,
@@ -40,7 +42,16 @@ const INSTAGRAM_MEDIA_TYPES = new Set(["p", "reel", "reels", "tv"]);
 
 export interface InstagramExtractionStats {
   path: "page" | "ytdlp";
-  images: { expected: number; got: number };
+  images: {
+    expected: number;
+    got: number;
+    /**
+     * Images saved as `linkImage` assets on this run. Informational only:
+     * storing is opt-in and a failure to store costs no text, so it never
+     * moves `extractionStatus`.
+     */
+    stored: number;
+  };
   videos: { expected: number; got: number };
 }
 
@@ -73,7 +84,7 @@ export function extractionStatus(
  * `[ig]` log line so an operator greps the same fields in both places.
  */
 function statsSegment(stats: InstagramExtractionStats): string {
-  return `path=${stats.path} images=${stats.images.got}/${stats.images.expected} videos=${stats.videos.got}/${stats.videos.expected} status=${extractionStatus(stats)}`;
+  return `path=${stats.path} images=${stats.images.got}/${stats.images.expected} stored=${stats.images.stored} videos=${stats.videos.got}/${stats.videos.expected} status=${extractionStatus(stats)}`;
 }
 
 /**
@@ -428,34 +439,123 @@ export async function transcribeInstagramVideos(
   }
 }
 
+export interface InstagramStoreTarget {
+  /** The bookmark the stored slides are attached to. */
+  bookmarkId: string;
+  userId: string;
+}
+
+export interface InstagramImageContext {
+  jobId: string;
+  runProxy: RunProxyConfig;
+  abortSignal: AbortSignal;
+  /**
+   * Where stored slides are attached. Absent on paths that have no bookmark
+   * in hand, which is also the only way to say "never store".
+   */
+  store?: InstagramStoreTarget;
+}
+
+/** Content types the CDN actually serves, mapped to a file extension. */
+const IMAGE_EXTENSIONS: Record<string, string> = {
+  "image/jpeg": "jpg",
+  "image/jpg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+};
+
 /**
- * Turn each image into indexable text. Instagram's alt text comes for free
- * and already names what is in the picture (and often quotes its text); when
- * image description is enabled, the image is also run through the same LLM
- * OCR prompt the asset pipeline uses, which recovers the full text of the
- * slide-style posts people actually save.
+ * `slide-01.jpg`, `slide-02.jpg`, … — zero-padded so a plain lexicographic
+ * sort of the file names reproduces the order of the carousel, which is how
+ * the gallery orders what it renders. The number is the image's position in
+ * the same filtered list `composeInstagramHtml` numbers as `[N]`, so the
+ * gallery and the text block agree on which slide is which.
+ */
+function slideFileName(index: number, contentType: string): string {
+  const ext = IMAGE_EXTENSIONS[contentType.toLowerCase()] ?? "jpg";
+  return `slide-${String(index + 1).padStart(2, "0")}.${ext}`;
+}
+
+/**
+ * Drop the slides a previous crawl stored for this bookmark, rows and files
+ * both, so a recrawl replaces the gallery instead of appending a second copy
+ * of it.
+ */
+async function deleteStoredImages(
+  target: InstagramStoreTarget,
+  jobId: string,
+): Promise<void> {
+  const where = and(
+    eq(assets.bookmarkId, target.bookmarkId),
+    eq(assets.assetType, AssetTypes.LINK_IMAGE),
+  );
+  const existing = await db.query.assets.findMany({
+    where,
+    columns: { id: true },
+  });
+  if (existing.length === 0) {
+    return;
+  }
+  await db.delete(assets).where(where);
+  await Promise.all(
+    existing.map((row) => silentDeleteAsset(target.userId, row.id)),
+  );
+  logger.info(
+    `[Crawler][${jobId}] Replacing ${existing.length} previously stored Instagram image(s)`,
+  );
+}
+
+/**
+ * Turn each image into indexable text, and — when CRAWLER_INSTAGRAM_STORE_IMAGES
+ * is on — keep the image itself as a `linkImage` asset on the bookmark.
+ *
+ * Instagram's alt text comes for free and already names what is in the
+ * picture (and often quotes its text); when image description is enabled, the
+ * image is also run through the same LLM OCR prompt the asset pipeline uses,
+ * which recovers the full text of the slide-style posts people actually save.
+ *
+ * Both consumers read the same bytes, fetched once per image, so enabling
+ * storing on top of OCR costs no extra requests (nor the reverse).
  *
  * Returns one string per image, in order (empty when that image yielded
- * nothing), plus how many images were actually processed as configured —
- * which is what the stats count, not how many happened to end up with text.
+ * nothing), how many images were actually processed as configured — which is
+ * what the stats count, not how many happened to end up with text — and how
+ * many were stored.
  */
-export async function describeInstagramImages(
+export async function processInstagramImages(
   images: InstagramMediaItem[],
-  jobId: string,
-  runProxy: RunProxyConfig,
-  abortSignal: AbortSignal,
-): Promise<{ texts: string[]; processed: number }> {
+  ctx: InstagramImageContext,
+): Promise<{ texts: string[]; processed: number; stored: number }> {
+  const { jobId, runProxy, abortSignal } = ctx;
   const inferenceClient = serverConfig.crawler.instagramDescribeImages
     ? InferenceClientFactory.build()
     : null;
+  const storeTarget = serverConfig.crawler.instagramStoreImages
+    ? ctx.store
+    : undefined;
   const max = serverConfig.crawler.instagramMaxImages;
+  const maxBytes = serverConfig.maxAssetSizeMb * 1024 * 1024;
   if (images.length > max) {
     logger.info(
-      `[Crawler][${jobId}] Post has ${images.length} images; describing the first ${max}`,
+      `[Crawler][${jobId}] Post has ${images.length} images; processing the first ${max}`,
     );
   }
+
+  // The previous crawl's slides are dropped only once a replacement is
+  // actually in hand: deleting up front would empty a perfectly good gallery
+  // on the run where the CDN happens to refuse every image.
+  let replaced = false;
+  const replaceOnce = async () => {
+    if (replaced || !storeTarget) {
+      return;
+    }
+    replaced = true;
+    await deleteStoredImages(storeTarget, jobId);
+  };
+
   const out: string[] = [];
   let processed = 0;
+  let stored = 0;
   for (const [i, image] of images.entries()) {
     if (abortSignal.aborted) {
       // Out of time: keep what we have and pad the rest so indices still
@@ -473,10 +573,13 @@ export async function describeInstagramImages(
     // reaching it is all "processed" can mean; when OCR was asked for, it has
     // to have come back without throwing.
     let ocrOk = true;
-    if (inferenceClient && image.imageUrl && i < max) {
+    const imageUrl = image.imageUrl;
+    if ((inferenceClient || storeTarget) && imageUrl && i < max) {
+      let bytes: Buffer | null = null;
+      let contentType = "image/jpeg";
       try {
         const response = await fetchWithProxy(
-          image.imageUrl,
+          imageUrl,
           {
             signal: AbortSignal.any([AbortSignal.timeout(20_000), abortSignal]),
           },
@@ -485,31 +588,79 @@ export async function describeInstagramImages(
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
         }
-        const contentType =
+        contentType =
           response.headers.get("content-type")?.split(";")[0] ?? "image/jpeg";
-        const base64 = Buffer.from(await response.arrayBuffer()).toString(
-          "base64",
-        );
-        const ocr = await inferenceClient.inferFromImage(
-          buildOCRPrompt(),
-          contentType,
-          base64,
-          {
-            schema: null,
-            abortSignal,
-            imageDetail: serverConfig.crawler.instagramOcrDetail,
-          },
-        );
-        const text = ocr.response.trim();
-        if (text) {
-          pieces.push(text);
-        }
+        bytes = Buffer.from(await response.arrayBuffer());
       } catch (e) {
-        // Keep the alt text; losing one image's OCR is not worth the post.
-        ocrOk = false;
-        logger.warn(
-          `[Crawler][${jobId}] Failed to describe image ${i + 1}: ${e}`,
-        );
+        // Keep the alt text; losing one image is not worth the post. Only an
+        // OCR request counts against the stats: a fetch made solely to store
+        // the image must never turn a complete text extraction into
+        // `status=partial`, which is the token the health probe greps.
+        if (inferenceClient) {
+          ocrOk = false;
+        }
+        logger.warn(`[Crawler][${jobId}] Failed to fetch image ${i + 1}: ${e}`);
+      }
+      if (bytes && inferenceClient) {
+        try {
+          const ocr = await inferenceClient.inferFromImage(
+            buildOCRPrompt(),
+            contentType,
+            bytes.toString("base64"),
+            {
+              schema: null,
+              abortSignal,
+              imageDetail: serverConfig.crawler.instagramOcrDetail,
+            },
+          );
+          const text = ocr.response.trim();
+          if (text) {
+            pieces.push(text);
+          }
+        } catch (e) {
+          ocrOk = false;
+          logger.warn(
+            `[Crawler][${jobId}] Failed to describe image ${i + 1}: ${e}`,
+          );
+        }
+      }
+      if (bytes && storeTarget) {
+        // The bytes are already in memory (the OCR path has always read them
+        // whole), so the size cap is checked here rather than mid-stream as
+        // `downloadAndStoreFile` does.
+        if (bytes.byteLength > maxBytes) {
+          logger.warn(
+            `[Crawler][${jobId}] Skipping storage of image ${i + 1}: ${bytes.byteLength} bytes exceeds the maximum allowed size of ${serverConfig.maxAssetSizeMb}MB`,
+          );
+        } else {
+          try {
+            const asset = await storeImageBytes(bytes, {
+              userId: storeTarget.userId,
+              jobId,
+              contentType,
+              fileName: slideFileName(i, contentType),
+            });
+            // `null` is a quota refusal: warned about already, and not worth
+            // failing the crawl over. It simply does not count as stored.
+            if (asset) {
+              await replaceOnce();
+              await db.insert(assets).values({
+                id: asset.assetId,
+                bookmarkId: storeTarget.bookmarkId,
+                userId: storeTarget.userId,
+                assetType: AssetTypes.LINK_IMAGE,
+                contentType: asset.contentType,
+                fileName: asset.fileName,
+                size: asset.size,
+              });
+              stored += 1;
+            }
+          } catch (e) {
+            logger.warn(
+              `[Crawler][${jobId}] Failed to store image ${i + 1}: ${e}`,
+            );
+          }
+        }
       }
     }
     if (ocrOk) {
@@ -517,7 +668,7 @@ export async function describeInstagramImages(
     }
     out.push(pieces.join(" — "));
   }
-  return { texts: out, processed };
+  return { texts: out, processed, stored };
 }
 
 /**
@@ -530,6 +681,7 @@ async function extractFromPage(
   jobId: string,
   runProxy: RunProxyConfig,
   abortSignal: AbortSignal,
+  store?: InstagramStoreTarget,
 ): Promise<InstagramContent | null> {
   const html = await fetchInstagramPage(url, jobId, runProxy, abortSignal);
   if (!html) {
@@ -584,8 +736,13 @@ async function extractFromPage(
   }
   const described =
     images.length > 0
-      ? await describeInstagramImages(images, jobId, runProxy, abortSignal)
-      : { texts: [], processed: 0 };
+      ? await processInstagramImages(images, {
+          jobId,
+          runProxy,
+          abortSignal,
+          store,
+        })
+      : { texts: [], processed: 0, stored: 0 };
   return {
     caption: media.caption,
     transcript: video.transcript,
@@ -594,7 +751,11 @@ async function extractFromPage(
     date: media.date,
     stats: {
       path: "page",
-      images: { expected: images.length, got: described.processed },
+      images: {
+        expected: images.length,
+        got: described.processed,
+        stored: described.stored,
+      },
       videos: { expected: videos.length, got: video.transcribed },
     },
   };
@@ -708,6 +869,7 @@ export async function extractInstagramContent(
   jobId: string,
   runProxy: RunProxyConfig,
   abortSignal: AbortSignal,
+  store?: InstagramStoreTarget,
 ): Promise<InstagramContent | null> {
   if (!/^https?:\/\//i.test(url)) {
     logger.warn(
@@ -716,7 +878,13 @@ export async function extractInstagramContent(
     return null;
   }
   try {
-    const fromPage = await extractFromPage(url, jobId, runProxy, abortSignal);
+    const fromPage = await extractFromPage(
+      url,
+      jobId,
+      runProxy,
+      abortSignal,
+      store,
+    );
     if (fromPage) {
       return fromPage;
     }
@@ -740,15 +908,17 @@ export async function handleInstagramBookmark(args: {
   url: string;
   jobId: string;
   bookmarkId: string;
+  userId: string;
   runProxy: RunProxyConfig;
   abortSignal: AbortSignal;
 }): Promise<boolean> {
-  const { url, jobId, bookmarkId, runProxy, abortSignal } = args;
+  const { url, jobId, bookmarkId, userId, runProxy, abortSignal } = args;
   const content = await extractInstagramContent(
     url,
     jobId,
     runProxy,
     abortSignal,
+    { bookmarkId, userId },
   );
   if (!content) {
     logger.warn(
