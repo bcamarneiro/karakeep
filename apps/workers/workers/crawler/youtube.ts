@@ -638,7 +638,7 @@ export async function handleYouTubeBookmark(args: {
       content.lang ?? "none"
     } chapters=${content.chapters.length} subs_status=${
       content.failed ? "partial" : "ok"
-    } store=${stored} url="${url}"`,
+    } store=${stored === "stored" ? "ok" : stored} url="${url}"`,
   );
   return stored === "gone" ? "gone" : "stored";
 }

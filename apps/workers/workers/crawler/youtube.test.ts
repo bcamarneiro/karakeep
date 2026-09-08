@@ -80,6 +80,7 @@ import {
   silentDeleteAsset,
 } from "@karakeep/shared/assetdb";
 import serverConfig from "@karakeep/shared/config";
+import logger from "@karakeep/shared/logger";
 
 import type { YouTubeContent } from "./youtube";
 import {
@@ -613,6 +614,21 @@ describe("handleYouTubeBookmark", () => {
     expect(written.htmlContent).toContain("<h2>Chapters</h2>");
     expect(written.htmlContent).toContain("<p>olá mundo</p>");
     expect(vi.mocked(saveAsset)).not.toHaveBeenCalled();
+  });
+
+  it("logs the subtitle status and the store outcome as separate tokens", async () => {
+    // The homelab probe greps these tokens verbatim, so they are pinned here:
+    // a throttled yt-dlp and a refused write are different problems.
+    findFirst.mockResolvedValue({ contentAssetId: null });
+    ytDlpWrites({ manual: { "yt.pt.vtt": vtt("olá mundo") } });
+    const info = vi.spyOn(logger, "info");
+    await call();
+    expect(info).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "[yt] path=ytdlp subs=manual lang=pt chapters=2 subs_status=ok store=ok",
+      ),
+    );
+    info.mockRestore();
   });
 
   it("falls back to the transcript for the description when there is none", async () => {
