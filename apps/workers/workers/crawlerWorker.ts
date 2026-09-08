@@ -390,7 +390,11 @@ async function runCrawler(
   // Instagram posts hide behind a login wall, so a normal browser crawl yields
   // an empty shell. When enabled, extract caption + transcript via yt-dlp
   // instead, then run the same downstream jobs (inference, search, video).
-  if (serverConfig.crawler.instagramEnabled && isInstagramUrl(url)) {
+  if (
+    serverConfig.crawler.instagramEnabled &&
+    !precrawledArchiveAssetId &&
+    isInstagramUrl(url)
+  ) {
     let extracted = false;
     try {
       extracted = await handleInstagramBookmark({
@@ -426,8 +430,12 @@ async function runCrawler(
   // which is strictly more than the page would have given us. If it yields
   // nothing we fall through to the normal crawl, so a broken yt-dlp is no
   // worse than not having this at all.
-  if (serverConfig.crawler.youtubeTranscript && isYouTubeUrl(url)) {
-    const handled = await handleYouTubeBookmark({
+  if (
+    serverConfig.crawler.youtubeEnabled &&
+    !precrawledArchiveAssetId &&
+    isYouTubeUrl(url)
+  ) {
+    const outcome = await handleYouTubeBookmark({
       url,
       jobId,
       bookmarkId,
@@ -435,8 +443,13 @@ async function runCrawler(
       runProxy,
       abortSignal: job.abortSignal,
     });
-    if (handled) {
+    if (outcome === "stored") {
       await enqueuePostCrawlJobs(job, bookmarkId, userId, url);
+      return { status: "completed" };
+    }
+    if (outcome === "gone") {
+      // The bookmark was deleted while yt-dlp ran: nothing to crawl, and
+      // nothing for the post-crawl jobs to work on.
       return { status: "completed" };
     }
     // Falling back means starting a fresh browser crawl; if the job was

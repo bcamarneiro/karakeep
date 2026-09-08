@@ -535,7 +535,7 @@ const CONTENT: YouTubeContent = {
     { title: "Intro", startTime: 0 },
     { title: "The <meat>", startTime: 65 },
   ],
-  transcript: "a < b & c",
+  transcript: "a < b & c, \"quoted\" and 'apostrophed'",
   subs: "manual",
   lang: "pt",
   failed: false,
@@ -554,8 +554,10 @@ describe("composeYouTubeHtml", () => {
         "<li>1:05 – The &lt;meat&gt;</li>",
         "</ul>",
         "<h2>Transcript</h2>",
-        "<p>a &lt; b &amp; c</p>",
-        "<p><small>Some Channel · 2026-01-15</small></p>",
+        // The shared escapeHtml escapes quotes and backticks too.
+        "<p>a &lt; b &amp; c, &quot;quoted&quot; and &#x27;apostrophed&#x27;</p>",
+        // durationSec renders after the channel and the date.
+        "<p><small>Some Channel · 2026-01-15 · 10:10</small></p>",
         "<!-- karakeep-yt subs=manual lang=pt status=ok -->",
       ].join("\n"),
     );
@@ -595,7 +597,7 @@ describe("handleYouTubeBookmark", () => {
     findFirst.mockResolvedValue({ contentAssetId: null });
     ytDlpWrites({ manual: { "yt.pt.vtt": vtt("olá mundo") } });
 
-    await expect(call()).resolves.toBe(true);
+    await expect(call()).resolves.toBe("stored");
 
     expect(setCalls).toHaveLength(1);
     const written = setCalls[0];
@@ -629,7 +631,7 @@ describe("handleYouTubeBookmark", () => {
     const before = serverConfig.crawler.htmlContentSizeThreshold;
     serverConfig.crawler.htmlContentSizeThreshold = 1;
     try {
-      await expect(call()).resolves.toBe(true);
+      await expect(call()).resolves.toBe("stored");
     } finally {
       serverConfig.crawler.htmlContentSizeThreshold = before;
     }
@@ -652,9 +654,10 @@ describe("handleYouTubeBookmark", () => {
     serverConfig.crawler.htmlContentSizeThreshold = 1;
     checkStorageQuota.mockRejectedValueOnce(new Error("over quota"));
     try {
-      // Still handled: the metadata is worth having, and falling through to
-      // the browser crawl would only crash Chrome.
-      await expect(call()).resolves.toBe(true);
+      // Still "stored": the metadata is worth having and the post-crawl jobs
+      // should run, and falling through to the browser would only crash
+      // Chrome on a page yt-dlp already read.
+      await expect(call()).resolves.toBe("stored");
     } finally {
       serverConfig.crawler.htmlContentSizeThreshold = before;
     }
@@ -667,16 +670,16 @@ describe("handleYouTubeBookmark", () => {
 
   it("reports not handled when yt-dlp yields nothing, so the caller can fall back", async () => {
     ytDlpWrites({ info: null });
-    await expect(call()).resolves.toBe(false);
+    await expect(call()).resolves.toBe("empty");
     expect(setCalls).toHaveLength(0);
   });
 
-  it("does nothing for a bookmark that is gone", async () => {
+  it("reports the bookmark as gone when it was deleted mid-job", async () => {
     findFirst.mockResolvedValue(undefined);
     ytDlpWrites({ manual: { "yt.pt.vtt": vtt("olá mundo") } });
-    // Extraction worked, so the URL is still considered handled; there is
-    // simply no row left to write to.
-    await expect(call()).resolves.toBe(true);
+    // A distinct outcome: there is no row to write to, so the caller must
+    // neither fall back to the browser nor enqueue the post-crawl jobs.
+    await expect(call()).resolves.toBe("gone");
     expect(setCalls).toHaveLength(0);
   });
 });

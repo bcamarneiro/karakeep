@@ -15,6 +15,7 @@ import serverConfig from "@karakeep/shared/config";
 import type { InferenceClient } from "@karakeep/shared/inference";
 import { InferenceClientFactory } from "@karakeep/shared/inference";
 import logger from "@karakeep/shared/logger";
+import { escapeHtml } from "@karakeep/shared/utils/htmlUtils";
 import { buildOCRPrompt } from "@karakeep/shared/prompts";
 
 import type { InstagramMediaItem } from "./instagramPage";
@@ -82,10 +83,6 @@ function statsSegment(stats: InstagramExtractionStats): string {
  */
 export function instagramMarker(stats: InstagramExtractionStats): string {
   return `<!-- karakeep-ig ${statsSegment(stats)} -->`;
-}
-
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 export function composeInstagramHtml(content: InstagramContent): string {

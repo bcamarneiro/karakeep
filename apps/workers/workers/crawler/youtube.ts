@@ -4,7 +4,7 @@
 // under a deliberate memory cap: the tab crashes, the base crawl fails, and
 // the bookmark ends up with no content at all. yt-dlp, by contrast, returns
 // everything anonymously and cheaply — title, description, channel, upload
-// date, chapters and subtitles — so when CRAWLER_YOUTUBE_TRANSCRIPT is on,
+// date, chapters and subtitles — so when CRAWLER_YOUTUBE_ENABLED is on,
 // YouTube links skip the browser entirely and are composed from yt-dlp's
 // metadata. If yt-dlp returns nothing, the caller falls back to the normal
 // crawl, so a broken yt-dlp degrades to the old behaviour rather than worse.
@@ -20,6 +20,7 @@ import { assets, AssetTypes, bookmarkLinks } from "@karakeep/db/schema";
 import { ASSET_TYPES, silentDeleteAsset } from "@karakeep/shared/assetdb";
 import serverConfig from "@karakeep/shared/config";
 import logger from "@karakeep/shared/logger";
+import { escapeHtml } from "@karakeep/shared/utils/htmlUtils";
 
 import { updateAsset } from "../../workerUtils";
 import { storeHtmlContent } from "./assetStorage";
@@ -65,10 +66,6 @@ export interface YouTubeContent extends YouTubeInfo {
    * `status=partial` while a video with no captions stays `status=ok`.
    */
   failed: boolean;
-}
-
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 /**
@@ -492,7 +489,9 @@ export function composeYouTubeHtml(content: YouTubeContent): string {
   const date = content.uploadDate
     ? content.uploadDate.replace(/^(\d{4})(\d{2})(\d{2})$/, "$1-$2-$3")
     : null;
-  const footer = [content.channel, date].filter(Boolean).join(" · ");
+  const duration =
+    content.durationSec !== null ? formatTimestamp(content.durationSec) : null;
+  const footer = [content.channel, date, duration].filter(Boolean).join(" · ");
   if (footer) {
     parts.push(`<p><small>${escapeHtml(footer)}</small></p>`);
   }
@@ -511,13 +510,15 @@ export function composeYouTubeHtml(content: YouTubeContent): string {
  * metadata is still written but the content is left exactly as it was:
  * writing the "nothing stored" shape would delete an earlier crawl's content.
  */
+type StoreOutcome = "stored" | "refused" | "gone";
+
 async function storeYouTubeHtml(args: {
   bookmarkId: string;
   userId: string;
   jobId: string;
   html: string;
   columns: Record<string, unknown>;
-}): Promise<boolean> {
+}): Promise<StoreOutcome> {
   const { bookmarkId, userId, jobId, html, columns } = args;
 
   const link = await db.query.bookmarkLinks.findFirst({
@@ -528,7 +529,7 @@ async function storeYouTubeHtml(args: {
     logger.warn(
       `[Crawler][${jobId}] Bookmark ${bookmarkId} is gone; not storing YouTube content`,
     );
-    return false;
+    return "gone";
   }
 
   const stored = await storeHtmlContent(html, userId, jobId);
@@ -540,7 +541,7 @@ async function storeYouTubeHtml(args: {
       .update(bookmarkLinks)
       .set(columns)
       .where(eq(bookmarkLinks.id, bookmarkId));
-    return false;
+    return "refused";
   }
 
   await db.transaction(async (txn) => {
@@ -573,13 +574,23 @@ async function storeYouTubeHtml(args: {
     }
   });
   await silentDeleteAsset(userId, link.contentAssetId ?? undefined);
-  return true;
+  return "stored";
 }
 
 /**
+ * What the caller should do next:
+ * - `"stored"`: the bookmark was written; run the post-crawl jobs. A refused
+ *   store lands here too — the metadata was written, and falling back to the
+ *   browser would only crash Chrome on a page we already read.
+ * - `"empty"`: yt-dlp gave us nothing; fall back to the browser crawl.
+ * - `"gone"`: the bookmark was deleted mid-job. There is nothing to crawl and
+ *   nothing to run jobs against; the job is simply over.
+ */
+export type YouTubeOutcome = "stored" | "empty" | "gone";
+
+/**
  * Read a YouTube bookmark with yt-dlp and store it, in place of the browser
- * crawl. Returns whether the bookmark was handled; false means the caller
- * should fall back to the normal crawl.
+ * crawl.
  */
 export async function handleYouTubeBookmark(args: {
   url: string;
@@ -588,7 +599,7 @@ export async function handleYouTubeBookmark(args: {
   userId: string;
   runProxy: RunProxyConfig;
   abortSignal: AbortSignal;
-}): Promise<boolean> {
+}): Promise<YouTubeOutcome> {
   const { url, jobId, bookmarkId, userId, runProxy, abortSignal } = args;
   const content = await extractYouTubeContent(
     url,
@@ -597,7 +608,7 @@ export async function handleYouTubeBookmark(args: {
     abortSignal,
   );
   if (!content) {
-    return false;
+    return "empty";
   }
 
   // A video may have an empty description, and a live recording an empty
@@ -618,12 +629,16 @@ export async function handleYouTubeBookmark(args: {
     },
   });
 
+  // Two independent things can go wrong, so they get two tokens: the subtitle
+  // fetch (subs_status) and the write (store). Collapsing them into one
+  // `status=partial` left an operator unable to tell a throttled yt-dlp from
+  // a full disk.
   logger.info(
     `[Crawler][${jobId}] [yt] path=ytdlp subs=${content.subs} lang=${
       content.lang ?? "none"
-    } chapters=${content.chapters.length} status=${
-      content.failed || !stored ? "partial" : "ok"
-    } url="${url}"`,
+    } chapters=${content.chapters.length} subs_status=${
+      content.failed ? "partial" : "ok"
+    } store=${stored} url="${url}"`,
   );
-  return true;
+  return stored === "gone" ? "gone" : "stored";
 }
