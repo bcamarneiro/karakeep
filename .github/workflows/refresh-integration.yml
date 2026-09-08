@@ -114,7 +114,13 @@ jobs:
         # build still works).
         if: steps.merge.outputs.status == 'conflict' || steps.merge.outputs.status == 'drift' || steps.verify.outcome == 'failure'
         env:
-          GH_TOKEN: ${{ github.token }}
+          # GITHUB_TOKEN cannot create issues in a fork ("Resource not accessible by
+          # integration", even with issues: write granted — verified 2026-09-08).
+          # Set the repo secret REFRESH_ISSUES_TOKEN to a fine-grained PAT (this
+          # repo, Issues: read/write) to get the tracking issue; without it the red
+          # run (and GitHub's failure e-mail to the workflow's last committer) is
+          # the only signal.
+          GH_TOKEN: ${{ secrets.REFRESH_ISSUES_TOKEN || github.token }}
           CONFLICT_BRANCH: ${{ steps.merge.outputs.status == 'conflict' && steps.merge.outputs.conflict_branch || (steps.merge.outputs.status == 'drift' && 'drift' || 'verification') }}
           FAILURE_REASON: ${{ steps.merge.outputs.status == 'drift' && format('**drift** — `origin/local-integration` carries {0} commit(s) that the recipe (upstream/main + shortener + instagram + homelab-config) does not reproduce, so a force-push would delete them. Move that work into a feature branch listed in the recipe, or drop it deliberately, then re-run', steps.merge.outputs.drift_count) || (steps.merge.outputs.status == 'conflict' && format('a merge conflict while merging `{0}`', steps.merge.outputs.conflict_branch) || 'a **verification failure** after a clean merge (shared/workers typecheck or the Instagram extractor tests failed against the merged tree — no textual merge conflict)') }}
           ISSUE_TITLE: "${{ steps.merge.outputs.status == 'drift' && 'Integration refresh: local-integration has commits the recipe would drop' || (steps.merge.outputs.status == 'conflict' && format('Integration refresh: conflict merging ''{0}''', steps.merge.outputs.conflict_branch) || 'Integration refresh: verification failed after merge') }}"
