@@ -52,6 +52,19 @@ jobs:
               exit 0
             fi
           done
+          # Never overwrite work that lives only on local-integration. Commits
+          # are compared by patch-id, so feature-branch commits that were
+          # rebased since still count as reproduced; anything else is drift
+          # (e.g. Sep 2026: 17 YouTube/carousel commits landed directly on
+          # local-integration and only a failing push kept them alive).
+          drift=$(git rev-list --no-merges --cherry-pick --right-only local-integration...origin/local-integration | wc -l | tr -d ' ')
+          if [ "$drift" != "0" ]; then
+            echo "origin/local-integration carries $drift commit(s) the recipe does not reproduce:"
+            git log --oneline --no-merges --cherry-pick --right-only local-integration...origin/local-integration
+            echo "drift_count=$drift" >> "$GITHUB_OUTPUT"
+            echo "status=drift" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           echo "status=merged" >> "$GITHUB_OUTPUT"
 
       - name: Setup (for verification)
@@ -61,12 +74,12 @@ jobs:
         # fork's own main branch. continue-on-error: a broken setup here (e.g.
         # a registry hiccup) must surface as a verify failure below, not skip
         # straight to a green push — see the note on the verify step.
-        if: steps.merge.outputs.status != 'conflict'
+        if: steps.merge.outputs.status == 'merged'
         continue-on-error: true
         uses: ./tooling/github/setup
 
       - name: Verify the merged branch still builds and its Instagram tests pass
-        if: steps.merge.outputs.status != 'conflict'
+        if: steps.merge.outputs.status == 'merged'
         id: verify
         continue-on-error: true
         run: |
@@ -99,12 +112,12 @@ jobs:
         # pass the Instagram tests (upstream frequently touches
         # packages/shared/inference.ts, so a clean merge is not proof the
         # build still works).
-        if: steps.merge.outputs.status == 'conflict' || steps.verify.outcome == 'failure'
+        if: steps.merge.outputs.status == 'conflict' || steps.merge.outputs.status == 'drift' || steps.verify.outcome == 'failure'
         env:
           GH_TOKEN: ${{ github.token }}
-          CONFLICT_BRANCH: ${{ steps.merge.outputs.status == 'conflict' && steps.merge.outputs.conflict_branch || 'verification' }}
-          FAILURE_REASON: ${{ steps.merge.outputs.status == 'conflict' && format('a merge conflict while merging `{0}`', steps.merge.outputs.conflict_branch) || 'a **verification failure** after a clean merge (shared/workers typecheck or the Instagram extractor tests failed against the merged tree — no textual merge conflict)' }}
-          ISSUE_TITLE: "${{ steps.merge.outputs.status == 'conflict' && format('Integration refresh: conflict merging ''{0}''', steps.merge.outputs.conflict_branch) || 'Integration refresh: verification failed after merge' }}"
+          CONFLICT_BRANCH: ${{ steps.merge.outputs.status == 'conflict' && steps.merge.outputs.conflict_branch || (steps.merge.outputs.status == 'drift' && 'drift' || 'verification') }}
+          FAILURE_REASON: ${{ steps.merge.outputs.status == 'drift' && format('**drift** — `origin/local-integration` carries {0} commit(s) that the recipe (upstream/main + shortener + instagram + homelab-config) does not reproduce, so a force-push would delete them. Move that work into a feature branch listed in the recipe, or drop it deliberately, then re-run', steps.merge.outputs.drift_count) || (steps.merge.outputs.status == 'conflict' && format('a merge conflict while merging `{0}`', steps.merge.outputs.conflict_branch) || 'a **verification failure** after a clean merge (shared/workers typecheck or the Instagram extractor tests failed against the merged tree — no textual merge conflict)') }}
+          ISSUE_TITLE: "${{ steps.merge.outputs.status == 'drift' && 'Integration refresh: local-integration has commits the recipe would drop' || (steps.merge.outputs.status == 'conflict' && format('Integration refresh: conflict merging ''{0}''', steps.merge.outputs.conflict_branch) || 'Integration refresh: verification failed after merge') }}"
         run: |
           # Dedupe on the TITLE, not the label: a label filter silently matches
           # nothing when the label is missing, which would reopen a new issue
