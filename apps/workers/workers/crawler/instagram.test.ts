@@ -592,12 +592,12 @@ describe("extractInstagramContent (page)", () => {
     ).toEqual({
       caption: "carousel caption",
       transcript: "",
-      images: ["May be an image of text", ""],
+      images: ["May be an image of text", "", ""],
       author: "Some User",
       date: "20260819",
       stats: {
         path: "page",
-        images: { expected: 2, got: 2, stored: 0 },
+        images: { expected: 3, got: 3, stored: 0 },
         videos: { expected: 1, got: 0 },
       },
     });
@@ -623,9 +623,11 @@ describe("extractInstagramContent (page)", () => {
     expect(content?.images).toEqual([
       "May be an image of text — text in image/jpeg",
       "text in image/jpeg",
+      "text in image/jpeg",
     ]);
-    // Only the two images were sent to the model, never the video poster.
-    expect(inferFromImage).toHaveBeenCalledTimes(2);
+    // Both images and the video's poster frame go to the model: reels put
+    // their hook text on the cover.
+    expect(inferFromImage).toHaveBeenCalledTimes(3);
   });
 
   it("caps the number of images sent to the model", async () => {
@@ -647,7 +649,7 @@ describe("extractInstagramContent (page)", () => {
     );
     expect(inferFromImage).toHaveBeenCalledTimes(1);
     // The alt text of the image past the cap is still kept.
-    expect(content?.images).toEqual(["May be an image of text — ocr", ""]);
+    expect(content?.images).toEqual(["May be an image of text — ocr", "", ""]);
   });
 
   it("sends images at the configured OCR detail", async () => {
@@ -788,6 +790,69 @@ describe("extractInstagramContent (page)", () => {
     expect(extractionStatus(content!.stats!)).toBe("partial");
   });
 
+  it("counts videos with no audio track at all as handled, not partial", async () => {
+    serverConfig.crawler.instagramTranscribe = true;
+    const transcribeAudio = vi.fn(async () => "should not happen");
+    vi.mocked(InferenceClientFactory.build).mockReturnValue({
+      transcribeAudio,
+    } as unknown as ReturnType<typeof InferenceClientFactory.build>);
+    servePage(twoVideoCarouselHtml());
+    vi.mocked(execa).mockImplementation((async (file: string) => {
+      if (file === "ffmpeg") {
+        throw new Error(
+          "Command failed with exit code 1: ffmpeg ...\nOutput file #0 does not contain any stream",
+        );
+      }
+      // yt-dlp's audio pass finds nothing either: the clips are silent.
+    }) as unknown as typeof execa);
+    const content = await extractInstagramContent(
+      "https://www.instagram.com/p/ABC123/",
+      "job1",
+      proxy,
+      signal,
+    );
+    expect(content?.transcript).toBe("");
+    expect(transcribeAudio).not.toHaveBeenCalled();
+    expect(content?.stats?.videos).toEqual({ expected: 2, got: 2 });
+    expect(extractionStatus(content!.stats!)).toBe("ok");
+  });
+
+  it("reads a reel's poster frame as an image so the bookmark gets a thumbnail", async () => {
+    serverConfig.crawler.instagramDescribeImages = true;
+    const inferFromImage = vi.fn(async () => ({
+      response: "hook text on the cover",
+      totalTokens: 1,
+    }));
+    vi.mocked(InferenceClientFactory.build).mockReturnValue({
+      inferFromImage,
+    } as unknown as ReturnType<typeof InferenceClientFactory.build>);
+    const payload = {
+      items: [
+        {
+          code: "REEL1",
+          media_type: 2,
+          taken_at: 1787181237,
+          caption: { text: "reel caption" },
+          user: { username: "someuser", full_name: "Some User" },
+          image_versions2: { candidates: [{ url: "https://cdn/poster.jpg" }] },
+          video_versions: [{ url: "https://cdn/reel.mp4" }],
+        },
+      ],
+    };
+    servePage(
+      `<html><script type="application/json" data-sjs>${JSON.stringify(payload)}</script></html>`,
+    );
+    const content = await extractInstagramContent(
+      "https://www.instagram.com/reel/REEL1/",
+      "job1",
+      proxy,
+      signal,
+    );
+    expect(content?.images).toEqual(["hook text on the cover"]);
+    expect(content?.stats?.images).toEqual({ expected: 1, got: 1, stored: 0 });
+    expect(inferFromImage).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps caption and partial images when the job is aborted mid-way", async () => {
     serverConfig.crawler.instagramDescribeImages = true;
     const controller = new AbortController();
@@ -811,9 +876,13 @@ describe("extractInstagramContent (page)", () => {
       controller.signal,
     );
     expect(content?.caption).toBe("carousel caption");
-    expect(content?.images).toEqual(["May be an image of text — first", ""]);
+    expect(content?.images).toEqual([
+      "May be an image of text — first",
+      "",
+      "",
+    ]);
     expect(content?.stats?.images).toEqual({
-      expected: 2,
+      expected: 3,
       got: 1,
       stored: 0,
     });

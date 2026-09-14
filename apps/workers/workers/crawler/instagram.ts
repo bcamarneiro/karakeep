@@ -686,7 +686,11 @@ async function extractFromPage(
     return null;
   }
   const videos = media.items.filter((i) => i.kind === "video" && i.videoUrl);
-  const images = media.items.filter((i) => i.kind === "image" && i.imageUrl);
+  // Every slide with a still goes down the image path — plain images and
+  // the poster frame of each video alike. Reels put their hook text on the
+  // cover, so OCR reads it, and the stored copy is what gives a video
+  // bookmark a thumbnail at all.
+  const images = media.items.filter((i) => i.imageUrl);
   logger.info(
     `[Crawler][${jobId}] Read Instagram post ${media.code} from its page: ${images.length} image(s), ${videos.length} video(s)`,
   );
@@ -699,6 +703,7 @@ async function extractFromPage(
           abortSignal,
         )
       : { transcript: "", transcribed: 0, noAudioStream: 0 };
+  let silentVideos = 0;
   // Some posts expose a video-only track in video_versions (audio is a
   // separate DASH stream), so ffmpeg finds nothing to transcribe. yt-dlp's
   // bestaudio selector reaches that separate track, anonymously. Only that
@@ -724,6 +729,16 @@ async function extractFromPage(
     ) {
       video = { ...video, ...viaYtDlp };
     }
+    // Neither ffmpeg nor yt-dlp found an audio track: the clips are silent
+    // (text-on-video carousels are common), so there is nothing to
+    // transcribe and nothing to retry. Count them as handled rather than
+    // leaving the post `partial` forever.
+    if (viaYtDlp.transcribed === 0) {
+      silentVideos = video.noAudioStream;
+      logger.info(
+        `[Crawler][${jobId}] ${silentVideos} video(s) have no audio track at all; treating them as silent`,
+      );
+    }
   }
   const described =
     images.length > 0
@@ -747,7 +762,10 @@ async function extractFromPage(
         got: described.processed,
         stored: described.stored,
       },
-      videos: { expected: videos.length, got: video.transcribed },
+      videos: {
+        expected: videos.length,
+        got: video.transcribed + silentVideos,
+      },
     },
   };
 }
