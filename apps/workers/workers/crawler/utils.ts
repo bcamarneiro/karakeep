@@ -40,3 +40,14 @@ export function shouldRetryCrawlStatusCode(statusCode: number | null): boolean {
   }
   return statusCode === 403 || statusCode === 429 || statusCode >= 500;
 }
+
+/**
+ * Playwright reports a renderer that ran out of memory (or was killed) as
+ * "Page crashed" / "Target crashed" on whatever call was in flight. Ad-heavy
+ * sites reach that on a memory-capped browser, and nothing about a retry
+ * changes the outcome.
+ */
+export function isRendererCrash(e: unknown): boolean {
+  const message = e instanceof Error ? e.message : String(e);
+  return /\b(Page|Target) crashed\b/i.test(message);
+}

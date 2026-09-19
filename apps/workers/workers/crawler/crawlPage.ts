@@ -47,7 +47,7 @@ import {
   trackContext,
   untrackContext,
 } from "./browser";
-import { truncateUrl } from "./utils";
+import { isRendererCrash, truncateUrl } from "./utils";
 
 const tracer = getTracer("@karakeep/workers");
 
@@ -769,6 +769,17 @@ export async function crawlPage(
           pdf,
           url: activePage.url(),
         };
+      } catch (e) {
+        if (!isRendererCrash(e)) {
+          throw e;
+        }
+        // A plain fetch still gets the article out of a page whose scripts
+        // blew the renderer's memory; that beats failing the bookmark five
+        // times over. Screenshots and PDFs are lost for this crawl only.
+        logger.warn(
+          `[Crawler][${jobId}] The browser's renderer crashed on "${truncateUrl(url)}"; falling back to a plain HTTP fetch`,
+        );
+        return await browserlessCrawlPage(jobId, url, abortSignal, runProxy);
       } finally {
         await closePageAndContext(page, context, browser, jobId);
       }
