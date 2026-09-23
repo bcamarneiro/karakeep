@@ -38,6 +38,7 @@ import type { ZReaderViewReason } from "@karakeep/shared/types/bookmarks";
 import { resolveShortenedBookmarkUrl } from "@karakeep/shared/utils/url";
 
 import type { ParseSubprocessOutput } from "../utils/parseHtmlSubprocessIpc";
+import { fetchBlockedPageFallback } from "./blockedFallback";
 import {
   isLikelyChallengePage,
   resolveMetadata,
@@ -252,6 +253,44 @@ export async function crawlAndParseUrl(
       }
       abortSignal.throwIfAborted();
 
+      let recoveredVia: "jina" | "wayback" | null = null;
+      // Blocked-page fallback (homelab, BRU-1622). Decided on the raw render,
+      // before the parse subprocess runs, so the parse sees the recovered
+      // article instead of the challenge shell. A retryable status code on a
+      // non-final attempt still goes through the retry path below when
+      // nothing is recovered — behaviour unchanged for that case.
+      if (
+        !precrawledArchiveAssetId &&
+        serverConfig.crawler.blockedFallback &&
+        (shouldRetryCrawlStatusCode(result.statusCode) ||
+          isLikelyChallengePage({
+            title:
+              /<title[^>]*>([^<]*)<\/title>/i
+                .exec(result.htmlContent)?.[1]
+                ?.trim() ?? null,
+            htmlContent: result.htmlContent,
+          }))
+      ) {
+        logger.info(
+          `[Crawler][${jobId}] The render looks blocked (status ${result.statusCode}); trying the blocked-page fallback.`,
+        );
+        const recovered = await fetchBlockedPageFallback({
+          url,
+          jobId,
+          runProxy,
+          abortSignal,
+        });
+        if (recovered) {
+          recoveredVia = recovered.via;
+          result = {
+            ...result,
+            htmlContent: recovered.htmlContent,
+            statusCode: 200,
+          };
+        }
+      }
+      abortSignal.throwIfAborted();
+
       const {
         htmlContent,
         screenshot,
@@ -316,12 +355,18 @@ export async function crawlAndParseUrl(
         );
       }
       const meta = resolveMetadata(renderMeta, probeMetadata, renderBlocked);
-      const readerViewReasons: ZReaderViewReason[] | null = readerViewAssessment
-        ? renderIsChallengePage &&
-          !readerViewAssessment.reasons.includes("challenge_page")
-          ? [...readerViewAssessment.reasons, "challenge_page"]
-          : readerViewAssessment.reasons
-        : null;
+      const baseReaderViewReasons: ZReaderViewReason[] | null =
+        readerViewAssessment
+          ? renderIsChallengePage &&
+            !readerViewAssessment.reasons.includes("challenge_page")
+            ? [...readerViewAssessment.reasons, "challenge_page"]
+            : readerViewAssessment.reasons
+          : null;
+      // Provenance of a recovered page lives here: it survives the parse (an
+      // HTML comment does not) and needs no schema migration.
+      const readerViewReasons: ZReaderViewReason[] | null = recoveredVia
+        ? [...(baseReaderViewReasons ?? []), `recovered_via_${recoveredVia}`]
+        : baseReaderViewReasons;
 
       const parseDate = (date: string | null | undefined) => {
         if (!date) {

@@ -82,6 +82,10 @@ export const zReaderViewReasonSchema = z.enum([
   "probably_readerable",
   "probably_not_readerable",
   "no_extracted_content",
+  // homelab (BRU-1622): the render was a block/challenge page and the content
+  // came from a third party that already had it. Possibly partial (paywall teaser).
+  "recovered_via_jina",
+  "recovered_via_wayback",
 ]);
 export type ZReaderViewReason = z.infer<typeof zReaderViewReasonSchema>;
 

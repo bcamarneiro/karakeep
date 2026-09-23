@@ -161,6 +161,11 @@ const allEnv = z.object({
   BROWSER_WEBSOCKET_URL: z.string().optional(),
   BROWSER_CONNECT_ONDEMAND: stringBool("false"),
   BROWSER_COOKIE_PATH: z.string().optional(),
+  // homelab (BRU-1622): when the render is a bot-challenge/block page, try
+  // sources that already have the article before giving up on the crawl.
+  CRAWLER_BLOCKED_FALLBACK: stringBool("true"),
+  CRAWLER_JINA_READER_URL: z.string().default("https://r.jina.ai"),
+  CRAWLER_JINA_API_KEY: z.string().optional(),
   CRAWLER_JOB_TIMEOUT_SEC: z.coerce.number().default(60),
   CRAWLER_NAVIGATE_TIMEOUT_SEC: z.coerce.number().default(30),
   CRAWLER_NUM_WORKERS: z.coerce.number().default(1),
@@ -452,6 +457,9 @@ const serverConfigSchema = allEnv.transform((val, ctx) => {
       browserWebSocketUrl: val.BROWSER_WEBSOCKET_URL,
       browserConnectOnDemand: val.BROWSER_CONNECT_ONDEMAND,
       browserCookiePath: val.BROWSER_COOKIE_PATH,
+      blockedFallback: val.CRAWLER_BLOCKED_FALLBACK,
+      jinaReaderUrl: val.CRAWLER_JINA_READER_URL,
+      jinaApiKey: val.CRAWLER_JINA_API_KEY,
       jobTimeoutSec: val.CRAWLER_JOB_TIMEOUT_SEC,
       navigateTimeoutSec: val.CRAWLER_NAVIGATE_TIMEOUT_SEC,
       downloadBannerImage: val.CRAWLER_DOWNLOAD_BANNER_IMAGE,
